@@ -199,3 +199,13 @@ function odadamping(D, Ds, F, Fs)
     F .= Fs
     return damp
 end
+
+function UHFSpin(Nα , Nβ, Cα, Cβ, S)
+    # Calculate S^2 
+    smo=transpose(Cα)*S*Cβ
+    sz=0.25*(Nα-Nβ)^2
+    smo2=smo.^2
+    sxy=0.5*(Nα+Nβ)-sum(smo2[1:Nα,1:Nβ])
+    spinsquare=sz+sxy
+    return(spinsquare)
+end
