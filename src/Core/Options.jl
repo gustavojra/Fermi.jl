@@ -270,7 +270,7 @@ macro get()
                     data[i,2] = format("{:5.5e}", val)
                 end
             end
-            pretty_table(data; header=["Keyword", "Current Value"])
+            pretty_table(data; column_labels=["Keyword", "Current Value"])
         end
     end
 end
@@ -504,7 +504,7 @@ macro lookup(A::Symbol)
                     data[i,2] = format("{:5.5e}", val)
                 end
             end
-            pretty_table(data; header=["Keyword", "Current Value"])
+            pretty_table(data; column_labels=["Keyword", "Current Value"])
         end
     end
 end
