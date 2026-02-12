@@ -93,16 +93,129 @@ function build_fock!(F::Array{Float64,2}, H::Array{Float64,2}, D::Array{Float64,
 end
 
 function build_fock!(F::Array{Float64}, H::Array{Float64}, D::Array{Float64}, ints::IntegralHelper{Float64,SparseERI,AtomicOrbitals})
-    D = D
     F .= H
     eri_vals = ints["ERI"].data
     idxs = ints["ERI"].indexes
 
     nbas = ints.orbitals.basisset.nbas
-    Farrays = [zeros(nbas, nbas) for i = 1:Threads.nthreads()]
 
-    Threads.@threads for z = eachindex(eri_vals)
-    @inbounds @fastmath begin
+    # --- BEGIN: replaced threaded accumulation with streaming worker-pool ---
+    chunksize = 1
+    ntasks = Threads.nthreads()
+
+    # prepare chunked work (vectors of linear indices)
+    chunks = [collect(chunk) for chunk in Iterators.partition(eachindex(eri_vals), chunksize)]
+    requests = Channel{Vector{Int}}(length(chunks))
+    for c in chunks
+        put!(requests, c)
+    end
+    close(requests)
+
+    # bounded channel to receive completed Ft matrices from workers
+    results = Channel{Matrix{Float64}}(ntasks)
+
+    @sync begin
+        for _ in 1:ntasks
+            Threads.@spawn begin
+                Ft = zeros(Float64, nbas, nbas)
+                for chunk in requests
+                    for z in chunk
+                        i, j, k, l = idxs[z] .+ 1
+                        ν = eri_vals[z]
+
+                        ij = Fermi.index2(i-1, j-1)
+                        kl = Fermi.index2(k-1, l-1)
+
+                        γij = i !== j
+                        γkl = k !== l
+                        γab = ij !== kl
+
+                        Xik = i === k ? 2.0 : 1.0
+                        Xjk = j === k ? 2.0 : 1.0
+                        Xil = i === l ? 2.0 : 1.0
+                        Xjl = j === l ? 2.0 : 1.0
+
+                        if γij && γkl && γab
+                            #J
+                            Ft[i,j] += 4.0*D[k,l]*ν
+                            Ft[k,l] += 4.0*D[i,j]*ν
+
+                            # K
+                            Ft[i,k] -= Xik*D[j,l]*ν
+                            Ft[j,k] -= Xjk*D[i,l]*ν
+                            Ft[i,l] -= Xil*D[j,k]*ν
+                            Ft[j,l] -= Xjl*D[i,k]*ν
+
+                        elseif γkl && γab
+                            # J
+                            Ft[i,j] += 4.0*D[k,l]*ν
+                            Ft[k,l] += 2.0*D[i,j]*ν
+
+                            # K
+                            Ft[i,k] -= Xik*D[j,l]*ν
+                            Ft[i,l] -= Xil*D[j,k]*ν
+                        elseif γij && γab
+                            # J
+                            Ft[i,j] += 2.0*D[k,l]*ν
+                            Ft[k,l] += 4.0*D[i,j]*ν
+
+                            # K
+                            Ft[i,k] -= Xik*D[j,l]*ν
+                            Ft[j,k] -= Xjk*D[i,l]*ν
+
+                        elseif γij && γkl
+                            # Only possible if i = k and j = l
+                            # and i < j ⇒ i < l
+
+                            # J
+                            Ft[i,j] += 4.0*D[k,l]*ν
+
+                            # K
+                            Ft[i,k] -= D[j,l]*ν
+                            Ft[i,l] -= D[j,k]*ν
+                            Ft[j,l] -= D[i,k]*ν
+                        elseif γab
+                            # J
+                            Ft[i,j] += 2.0*D[k,l]*ν
+                            Ft[k,l] += 2.0*D[i,j]*ν
+                            # K
+                            Ft[i,k] -= Xik*D[j,l]*ν
+                        else
+                            Ft[i,j] += 2.0*D[k,l]*ν
+                            Ft[i,k] -= D[j,l]*ν
+                        end
+                    end
+                end
+                put!(results, Ft)
+            end
+        end
+    end
+
+    # Consume worker results
+    for _ in 1:ntasks
+        Ft = take!(results)
+        for i in 1:nbas
+            F[i,i] += Ft[i,i]
+            for j in (i+1):nbas
+                F[i,j] += Ft[i,j] + Ft[j,i]
+                F[j,i] = F[i,j]
+            end
+        end
+    end
+    return F
+end
+
+## This is the old version of build_fock! that uses threaded accumulation into thread-specific arrays, 
+# which is no longer recommended. Left here a token of admiraton for the times where threading was simpler to implement and understand RIP.
+function old_build_fock!(F::Array{Float64}, H::Array{Float64}, D::Array{Float64}, ints::IntegralHelper{Float64,SparseERI,AtomicOrbitals})
+    F .= H
+    eri_vals = ints["ERI"].data
+    idxs = ints["ERI"].indexes
+
+    nbas = ints.orbitals.basisset.nbas
+    Farrays = [zeros(nbas, nbas) for i = 1:Threads.maxthreadid()]
+
+    Threads.@threads :static for z = eachindex(eri_vals)
         i,j,k,l = idxs[z] .+ 1
         ν = eri_vals[z]
         Ft = Farrays[Threads.threadid()]
@@ -170,16 +283,13 @@ function build_fock!(F::Array{Float64}, H::Array{Float64}, D::Array{Float64}, in
             Ft[i,k] -= D[j,l]*ν
         end
     end
-    end
 
     Fred = sum(Farrays)
-    Threads.@threads for i = 1:nbas
-        @inbounds @fastmath begin
-            F[i,i] += Fred[i,i] 
-            for j = (i+1):nbas
-                F[i,j] += Fred[i,j] + Fred[j,i]
-                F[j,i] = F[i,j]
-            end
+    Threads.@threads :static for i = 1:nbas
+        F[i,i] += Fred[i,i] 
+        for j = (i+1):nbas
+            F[i,j] += Fred[i,j] + Fred[j,i]
+            F[j,i] = F[i,j]
         end
     end
     F
