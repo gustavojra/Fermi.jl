@@ -1,5 +1,5 @@
 using LinearAlgebra
-using Formatting
+using Format
 import Base: length, eltype, show
 
 export FermiSparse

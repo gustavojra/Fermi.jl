@@ -1,6 +1,6 @@
 export @get, @set, @reset, @molecule, @lookup, @freezecore
 
-using Formatting
+using Format
 using PrettyTables
 
 """
