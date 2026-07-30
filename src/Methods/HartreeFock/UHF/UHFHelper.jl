@@ -75,107 +75,132 @@ function build_fock!(Fα, Fβ, Jα, Jβ, Kα, Kβ, Dα, Dβ, ints::IntegralHelpe
 end
 
 function calcJK!(J, K, D, ints::IntegralHelper{Float64,<:SparseERI,AtomicOrbitals})
-    D = D
     J .= 0.0
     K .= 0.0
     eri_vals = ints["ERI"].data
     idxs = ints["ERI"].indexes
 
     nbas = ints.orbitals.basisset.nbas
-    Jarrays = [zeros(Int((nbas^2 + nbas)/2)) for i = 1:Threads.nthreads()]
-    Karrays = [zeros(Int((nbas^2 + nbas)/2)) for i = 1:Threads.nthreads()]
+    packed_size = Int((nbas^2 + nbas)/2)
 
-    Threads.@threads for z = eachindex(eri_vals)
-        i,j,k,l = idxs[z] .+ 1
-        ν = eri_vals[z]
-        Jt = Jarrays[Threads.threadid()]
-        Kt = Karrays[Threads.threadid()]
-        @inbounds begin
-            @fastmath begin
-            ij = Fermi.index2(i-1,j-1)
-            ik = Fermi.index2(i-1,k-1) + 1
-            il = Fermi.index2(i-1,l-1) + 1
+    # Streaming worker-pool: each task owns its own local Jt/Kt buffers and pulls
+    # work off a shared queue, instead of indexing a per-thread array by
+    # Threads.threadid() (unsafe under task migration / dynamic scheduling).
+    chunksize = 1
+    ntasks = Threads.nthreads()
 
-            jk = Fermi.index2(j-1,k-1) + 1
-            jl = Fermi.index2(j-1,l-1) + 1
+    chunks = [collect(chunk) for chunk in Iterators.partition(eachindex(eri_vals), chunksize)]
+    requests = Channel{Vector{Int}}(length(chunks))
+    for c in chunks
+        put!(requests, c)
+    end
+    close(requests)
 
-            kl = Fermi.index2(k-1,l-1) 
+    results = Channel{Tuple{Vector{Float64},Vector{Float64}}}(ntasks)
 
-            γij = i !== j
-            Xik = i === k ? 2 : 1
-            Xjk = j === k ? 2 : 1
+    @sync begin
+        for _ in 1:ntasks
+            Threads.@spawn begin
+                Jt = zeros(Float64, packed_size)
+                Kt = zeros(Float64, packed_size)
+                for chunk in requests
+                    for z in chunk
+                        i,j,k,l = idxs[z] .+ 1
+                        ν = eri_vals[z]
+                        @inbounds begin
+                            @fastmath begin
+                            ij = Fermi.index2(i-1,j-1)
+                            ik = Fermi.index2(i-1,k-1) + 1
+                            il = Fermi.index2(i-1,l-1) + 1
 
-            γkl = k !== l
-            γab = ij !== kl
+                            jk = Fermi.index2(j-1,k-1) + 1
+                            jl = Fermi.index2(j-1,l-1) + 1
 
-            Xil = i === l ? 2 : 1
-            Xjl = j === l ? 2 : 1
-            if γij && γkl && γab
-                # J
-                Jt[ij+1] += 2*D[k,l]*ν
-                Jt[kl+1] += 2*D[i,j]*ν
+                            kl = Fermi.index2(k-1,l-1)
 
-                # K
-                Kt[ik] += Xik*D[j,l]*ν
-                Kt[jk] += Xjk*D[i,l]*ν
-                Kt[il] += Xil*D[j,k]*ν
-                Kt[jl] += Xjl*D[i,k]*ν
+                            γij = i !== j
+                            Xik = i === k ? 2 : 1
+                            Xjk = j === k ? 2 : 1
 
-            elseif γkl && γab
-                # J
-                Jt[ij+1] += 2*D[k,l]*ν
-                Jt[kl+1] += 1*D[i,j]*ν
+                            γkl = k !== l
+                            γab = ij !== kl
 
-                # K
-                Kt[ik] += Xik*D[j,l]*ν
-                Kt[il] += Xil*D[j,k]*ν
-            elseif γij && γab
-                # J
-                Jt[ij+1] += 1*D[k,l]*ν
-                Jt[kl+1] += 2*D[i,j]*ν
+                            Xil = i === l ? 2 : 1
+                            Xjl = j === l ? 2 : 1
+                            if γij && γkl && γab
+                                # J
+                                Jt[ij+1] += 2*D[k,l]*ν
+                                Jt[kl+1] += 2*D[i,j]*ν
 
-                # K
-                Kt[ik] += Xik*D[j,l]*ν
-                Kt[jk] += Xjk*D[i,l]*ν
+                                # K
+                                Kt[ik] += Xik*D[j,l]*ν
+                                Kt[jk] += Xjk*D[i,l]*ν
+                                Kt[il] += Xil*D[j,k]*ν
+                                Kt[jl] += Xjl*D[i,k]*ν
 
-            elseif γij && γkl
+                            elseif γkl && γab
+                                # J
+                                Jt[ij+1] += 2*D[k,l]*ν
+                                Jt[kl+1] += 1*D[i,j]*ν
 
-                # Only possible if i = k and j = l
-                # and i < j ⇒ i < l
+                                # K
+                                Kt[ik] += Xik*D[j,l]*ν
+                                Kt[il] += Xil*D[j,k]*ν
+                            elseif γij && γab
+                                # J
+                                Jt[ij+1] += 1*D[k,l]*ν
+                                Jt[kl+1] += 2*D[i,j]*ν
 
-                # J
-                Jt[ij+1] += 2*D[k,l]*ν
+                                # K
+                                Kt[ik] += Xik*D[j,l]*ν
+                                Kt[jk] += Xjk*D[i,l]*ν
 
-                # K
-                Kt[ik] += D[j,l]*ν
-                Kt[il] += D[j,k]*ν
-                Kt[jl] += D[i,k]*ν
-            elseif γab
-                # J
-                Jt[ij+1] += 1*D[k,l]*ν
-                Jt[kl+1] += 1*D[i,j]*ν
-                # K
-                Kt[ik] += Xik*D[j,l]*ν
-            else
-                Jt[ij+1] += 1*D[k,l]*ν
-                Kt[ik] += D[j,l]*ν
-            end
+                            elseif γij && γkl
+
+                                # Only possible if i = k and j = l
+                                # and i < j ⇒ i < l
+
+                                # J
+                                Jt[ij+1] += 2*D[k,l]*ν
+
+                                # K
+                                Kt[ik] += D[j,l]*ν
+                                Kt[il] += D[j,k]*ν
+                                Kt[jl] += D[i,k]*ν
+                            elseif γab
+                                # J
+                                Jt[ij+1] += 1*D[k,l]*ν
+                                Jt[kl+1] += 1*D[i,j]*ν
+                                # K
+                                Kt[ik] += Xik*D[j,l]*ν
+                            else
+                                Jt[ij+1] += 1*D[k,l]*ν
+                                Kt[ik] += D[j,l]*ν
+                            end
+                            end
+                        end
+                    end
+                end
+                put!(results, (Jt, Kt))
             end
         end
     end
 
-    # Reduce values produces by each thread
+    # Reduce values produced by each worker
+    Jpacked = zeros(Float64, packed_size)
+    Kpacked = zeros(Float64, packed_size)
+    for _ in 1:ntasks
+        Jt, Kt = take!(results)
+        Jpacked .+= Jt
+        Kpacked .+= Kt
+    end
+
     for i::Int16 = 1:nbas
         for j::Int16 = i:nbas
             @inbounds begin
                 ij = Fermi.index2(i-1,j-1)
-                for k = eachindex(Jarrays)
-                    J[i,j] += Jarrays[k][ij+1]
-                end
-
-                for k = eachindex(Karrays)
-                    K[i,j] += Karrays[k][ij+1]
-                end
+                J[i,j] = Jpacked[ij+1]
+                K[i,j] = Kpacked[ij+1]
 
                 J[j,i] = J[i,j]
                 K[j,i] = K[i,j]
