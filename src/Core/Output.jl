@@ -1,12 +1,12 @@
 using Fermi.Options
-using Formatting
+using Format
 
 export output
 
 """
     Fermi.output(str, x...; ending="\\n")
 
-Writes a Python-style String `str` formatted with the values `x...`. The formatting is done through the package Formatting.jl.
+Writes a Python-style String `str` formatted with the values `x...`. The formatting is done through the package Format.jl.
 The string is printed into the standard output or written into a file depending on the `printstyle` option. See below:
 
     printstyle: 

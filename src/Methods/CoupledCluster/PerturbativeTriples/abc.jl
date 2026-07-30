@@ -43,21 +43,33 @@ function RCCSDpT(ccsd::RCCSD, moints::IntegralHelper{T,E,O}, Alg::abc) where {T<
     fo = moints["Fii"]
     fv = moints["Faa"]
 
-    # Pre-allocate Intermediate arrays
-    Ws  = [Array{T}(undef, o,o,o) for _ = 1:Threads.nthreads()] 
-    Vs  = [Array{T}(undef, o,o,o) for _ = 1:Threads.nthreads()] 
-    Evals = zeros(T, Threads.nthreads())
-
     output("Computing energy contribution from occupied orbitals:")
     BLAS_THREADS = BLAS.get_num_threads()
     BLAS.set_num_threads(1)
 
+    # Streaming worker-pool: each task owns its own local W/V buffers and energy
+    # accumulator, pulling `a` values off a shared queue, instead of indexing
+    # per-thread arrays by Threads.threadid() (unsafe under task migration).
+    # The workload per `a` is triangular, so a dynamic queue also balances load
+    # better than a static split across threads.
+    ntasks = Threads.nthreads()
+    requests = Channel{Int}(v)
+    for a in 1:v
+        put!(requests, a)
+    end
+    close(requests)
+
+    results = Channel{T}(ntasks)
+
     t = @elapsed begin
-    Threads.@threads for a in 1:v
+    @sync for _ in 1:ntasks
+        Threads.@spawn begin
+        W = Array{T}(undef, o,o,o)
+        V = Array{T}(undef, o,o,o)
+        Eval_local = zero(T)
+
+        for a in requests
     @inbounds begin
-        id = Threads.threadid()
-        W = Ws[id]
-        V = Vs[id]
 
         # T1 views → V
         @views T1_a   = T1[:,a]
@@ -148,19 +160,25 @@ function RCCSDpT(ccsd::RCCSD, moints::IntegralHelper{T,E,O}, Alg::abc) where {T<
                             Z = (V[i,k,j] + V[j,i,k] + V[k,j,i])
                             Ef  = (Y - 2*Z)*(W[i,j,k] + W[k,i,j] + W[j,k,i]) 
                             Ef += (Z - 2*Y)*(W[i,k,j] + W[j,i,k] + W[k,j,i]) + 3*X
-                            Evals[id] += 2*Ef / (Dd * (1+ δij + δjk)*(1 + δab + δbc))
+                            Eval_local += 2*Ef / (Dd * (1+ δij + δjk)*(1 + δab + δbc))
                         end
                     end
-                end 
+                end
             end
         end
         #output("  Orbital {} ✔️", a)
-    end # Threads (i loop)
     end # inbounds
+        end # for a in requests
+        put!(results, Eval_local)
+        end # spawn
+    end # sync
     end # time
 
     BLAS.set_num_threads(BLAS_THREADS)
-    Et = sum(Evals)
+    Et = zero(T)
+    for _ in 1:ntasks
+        Et += take!(results)
+    end
     output("Finished in {:5.5f} s", t)
     output("Final (T) contribution: {:15.10f}", Et)
     output("CCSD(T) energy:         {:15.10f}", Et+ccsd.energy)

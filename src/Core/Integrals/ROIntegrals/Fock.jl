@@ -10,7 +10,7 @@ function compute_F!(I::IntegralHelper{T,Chonky,<:AbstractRestrictedOrbitals}, ao
 
     Co = I.orbitals.C[:,1:ndocc]
     if eltype(I.orbitals.C) !== T
-        Co = T.(Cv)
+        Co = T.(Co)
     end
 
     # Build Atomic Fock

@@ -7,7 +7,7 @@ using Fermi.Options
 using Fermi.PhysicalConstants: atomic_number, bohr_to_angstrom
 
 using LinearAlgebra
-using Formatting
+using Format
 
 import Base: show
 

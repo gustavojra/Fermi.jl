@@ -97,45 +97,61 @@ function RMP2_energy(ints::IntegralHelper{T, <:AbstractDFERI, RHFOrbitals}, Alg:
     v_size = length(ϵv)
     o_size = length(ϵo)
 
-    # Pre-allocating arrays for threads
-    BABs = [zeros(T, v_size, v_size) for _ = 1:Threads.nthreads()]
-
-    # Disable BLAS threading
+    # Disable BLAS threading: parallelism happens over occupied index `i` below,
+    # each task running single-threaded BLAS (mul!) to avoid oversubscription.
     nt  = BLAS.get_num_threads()
     BLAS.set_num_threads(1)
 
-    # Vector containing the energy contribution computed by each thread
-    ΔMP2s = zeros(T,Threads.nthreads())
     TWO = T(2.0)
     ONE = one(T)
+
+    # Streaming worker-pool: each task owns its own local Bab buffer and energy
+    # accumulator, pulling `i` values off a shared queue, instead of indexing
+    # per-thread arrays by Threads.threadid() (unsafe under task migration).
+    ntasks = Threads.nthreads()
+    requests = Channel{Int}(o_size)
+    for i in 1:o_size
+        put!(requests, i)
+    end
+    close(requests)
+
+    results = Channel{T}(ntasks)
+
     t = @elapsed begin
-        @sync for i in 1:o_size
+        @sync for _ in 1:ntasks
             Threads.@spawn begin
-            id = Threads.threadid()
+            Bab = zeros(T, v_size, v_size)
+            ΔMP2_local = zero(T)
 
-            Bab = BABs[id]
-            @views Bi = Bvo[:,:,i]
+            for i in requests
+                @views Bi = Bvo[:,:,i]
 
-            for j in i:o_size
+                for j in i:o_size
 
-                @views Bj = Bvo[:,:,j]
-                mul!(Bab, transpose(Bi), Bj)
+                    @views Bj = Bvo[:,:,j]
+                    mul!(Bab, transpose(Bi), Bj)
 
-                eij = ϵo[i] + ϵo[j]
-                E = zero(T)
-                @inbounds for a = eachindex(ϵv)
-                    eija = eij - ϵv[a]
-                    for b = eachindex(ϵv)
-                        D = eija - ϵv[b]
-                        E += Bab[a,b] * (TWO * Bab[a,b] - Bab[b,a]) / D
+                    eij = ϵo[i] + ϵo[j]
+                    E = zero(T)
+                    @inbounds for a = eachindex(ϵv)
+                        eija = eij - ϵv[a]
+                        for b = eachindex(ϵv)
+                            D = eija - ϵv[b]
+                            E += Bab[a,b] * (TWO * Bab[a,b] - Bab[b,a]) / D
+                        end
                     end
+                    fac = i !== j ? TWO : ONE
+                    ΔMP2_local += fac * E
                 end
-                fac = i !== j ? TWO : ONE 
-                ΔMP2s[id] += fac * E
             end
-        end # spawn
+            put!(results, ΔMP2_local)
+            end # spawn
         end # sync
-        Emp2 = sum(ΔMP2s)
+
+        Emp2 = zero(T)
+        for _ in 1:ntasks
+            Emp2 += take!(results)
+        end
     end # time
     output("Done in {:5.5f} seconds.", t)
 
@@ -149,26 +165,46 @@ function RMP2_energy(ints::IntegralHelper{T, Chonky, RHFOrbitals}, Alg::RMP2Algo
     ϵo = ints["Fii"]
     ϵv = ints["Faa"]
 
-    ΔMP2s = zeros(T,Threads.nthreads())
     TWO = T(2.0)
+
+    # Streaming worker-pool: each task keeps a local accumulator and pulls `b`
+    # values off a shared queue, instead of indexing a per-thread array by
+    # Threads.threadid() (unsafe under task migration / dynamic scheduling).
+    ntasks = Threads.nthreads()
+    requests = Channel{Int}(length(ϵv))
+    for b in eachindex(ϵv)
+        put!(requests, b)
+    end
+    close(requests)
+
+    results = Channel{T}(ntasks)
+
     t = @elapsed begin
-        @sync for b in eachindex(ϵv)
+        @sync for _ in 1:ntasks
             Threads.@spawn begin
-            id = Threads.threadid()
-            for a in eachindex(ϵv)
-                @inbounds ϵ_ab = ϵv[a] + ϵv[b]
-                for j in eachindex(ϵo)
-                    @inbounds ϵ_abj = ϵo[j] - ϵ_ab
-                    for i in eachindex(ϵo)
-                        @fastmath @inbounds ΔMP2s[id] += ovov[i,a,j,b]*(TWO*ovov[i,a,j,b] - ovov[i,b,j,a]) / (ϵo[i]+ϵ_abj)
+            ΔMP2_local = zero(T)
+            for b in requests
+                for a in eachindex(ϵv)
+                    @inbounds ϵ_ab = ϵv[a] + ϵv[b]
+                    for j in eachindex(ϵo)
+                        @inbounds ϵ_abj = ϵo[j] - ϵ_ab
+                        for i in eachindex(ϵo)
+                            @fastmath @inbounds ΔMP2_local += ovov[i,a,j,b]*(TWO*ovov[i,a,j,b] - ovov[i,b,j,a]) / (ϵo[i]+ϵ_abj)
+                        end
                     end
                 end
             end
+            put!(results, ΔMP2_local)
             end
+        end
+
+        Emp2 = zero(T)
+        for _ in 1:ntasks
+            Emp2 += take!(results)
         end
     end
     output("Done in {:5.5f} s\n", t)
-    return sum(ΔMP2s)
+    return Emp2
 end
 
 function RMP2_energy(ints::IntegralHelper{T, Chonky, <:AbstractRestrictedOrbitals}, Alg::RMP2Algorithm) where T<:AbstractFloat

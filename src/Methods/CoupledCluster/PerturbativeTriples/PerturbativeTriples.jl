@@ -1,9 +1,11 @@
 abstract type RpTAlgorithm end
 
 function get_rpt_alg()
-    implemented = [ijk(), ijk2(), abc()]
+    # NOTE: `abc` is intentionally excluded here (see below) — it is known to
+    # produce an incorrect CCSD(T) energy and is disabled pending investigation.
+    implemented = [ijk(), ijk2()]
     N = Options.get("pt_alg")
-    try 
+    try
         return implemented[N]
     catch BoundsError
         throw(FermiException("implementation number $N not available for RCCSD(T)."))
@@ -44,9 +46,16 @@ get_pt_alg(x::Val{1}) = ijk()
 struct ijk2 <: RpTAlgorithm end
 include("ijk2.jl")
 get_pt_alg(x::Val{2}) = ijk2()
+
+# `abc` is a legacy (T) implementation kept for reference. It is known to give
+# an incorrect energy (see conversation/commit history) and is deliberately
+# left out of both `get_rpt_alg` and `get_pt_alg`'s dispatch table, so it is
+# unreachable through the `pt_alg` option. The type/file are still loaded so
+# the code compiles and remains available for direct, manual use
+# (`RCCSDpT(ccsd, moints, Fermi.CoupledCluster.abc())`) if someone wants to
+# pick the investigation back up.
 struct abc <: RpTAlgorithm end
 include("abc.jl")
-get_pt_alg(x::Val{3}) = abc()
 
 function RCCSDpT(x...)
     if !any(i-> i isa RpTAlgorithm, x)
