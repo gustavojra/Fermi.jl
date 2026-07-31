@@ -16,3 +16,4 @@ coverage.jl
 *.info
 deps/lib/README.txt
 *ipynb_checkpoints*
+CLAUDE.md
