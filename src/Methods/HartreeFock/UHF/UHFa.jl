@@ -161,9 +161,11 @@ function UHF(ints::IntegralHelper{Float64, <:AbstractERI, AtomicOrbitals}, Cα::
 
     nocc = Nα + Nβ  # TODO
     nvir = 2*m - nocc   #    output(repeat("-",80))
+    spinsquare=UHFSpin(Nα , Nβ, Cα, Cβ, S)
 
     output("    UHF done in {:>5.2f}s", t)
     output("    @Final UHF Energy     {:>20.12f} Eₕ", E)
+    output("    <S^2> = {:> 15.10f}",spinsquare)
     output("\n   • Orbitals Summary",)
     output("\n   ⬗ Alpha (α) orbitals")
     output("\n {:>10}   {:>15}   {:>10}", "Orbital", "Energy", "Occupancy")
