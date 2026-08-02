@@ -51,8 +51,9 @@ struct IntegralHelper{T<:AbstractFloat,E<:AbstractERI,O<:AbstractOrbitals}
     molecule::Molecule
     orbitals::O
     basis::String
-    cache::Dict{String,AbstractArray{T}} 
+    cache::Dict{String,AbstractArray{T}}
     eri_type::E
+    aoints::Base.RefValue{Any} # Lazily-built AtomicOrbitals IntegralHelper, shared across single-arg compute! calls
 end
 
 function IntegralHelper(x...;k...)
@@ -89,8 +90,8 @@ function IntegralHelper{T}(;molecule = Molecule(), orbitals = nothing,
         eri_type = orbitals isa AtomicOrbitals ? SparseERI() : Chonky()
     end
 
-    cache = Dict{String, AbstractArray{T}}() 
-    IntegralHelper(molecule, orbitals, basis, cache, eri_type)
+    cache = Dict{String, AbstractArray{T}}()
+    IntegralHelper(molecule, orbitals, basis, cache, eri_type, Ref{Any}(nothing))
 end
 
 function IntegralHelper{T}(bset::BasisSet, eri_type=nothing) where T<:AbstractFloat

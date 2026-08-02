@@ -57,7 +57,7 @@ NOTE: It does not include off-diagonal Fock contributions: See `od_cc_update_T1`
 function cc_update_T1!(newT1::AbstractArray{T,2}, T1::AbstractArray{T,2}, T2::AbstractArray{T,4}, moints::IntegralHelper{T,E,O}, 
                       alg::RCCSDa) where {T<:AbstractFloat, E<:AbstractERI, O<:AbstractRestrictedOrbitals}
 
-    Voooo, Vooov, Voovv, Vovov, Vovvv, Vvvvv = moints["OOOO"], moints["OOOV"], moints["OOVV"], moints["OVOV"], moints["OVVV"], moints["VVVV"]
+    Vooov, Voovv, Vovov, Vovvv = moints["OOOV"], moints["OOVV"], moints["OVOV"], moints["OVVV"]
     TWO = T(2)
     FOUR = T(4)
     @tensoropt (i=>x, j=>x, k=>x, l=>x, a=>10x, b=>10x, c=>10x, d=>10x) begin
@@ -123,7 +123,7 @@ NOTE: It does not include off-diagonal Fock contributions: See `od_cc_update_T2`
 function cc_update_T2!(newT2::AbstractArray{T,4}, T1::AbstractArray{T,2}, T2::AbstractArray{T,4}, moints::IntegralHelper{T,E,O}, 
                     alg::RCCSDa) where {T<:AbstractFloat, E<:AbstractERI, O<:AbstractRestrictedOrbitals}
 
-    Voooo, Vooov, Voovv, Vovov, Vovvv, Vvvvv = moints["OOOO"], moints["OOOV"], moints["OOVV"], moints["OVOV"], moints["OVVV"], moints["VVVV"]
+    Voooo, Vooov, Voovv, Vovov, Vovvv = moints["OOOO"], moints["OOOV"], moints["OOVV"], moints["OVOV"], moints["OVVV"]
 
     # Include (VV,VV) term. This is the only part that changes with Density Fitting
     cc_update_T2_v4_term!(newT2, T1, T2, moints, alg)
