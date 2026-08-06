@@ -58,9 +58,16 @@ Edf =   [-75.41960080317435, -39.56380446089254, -38.93785583198393]
             Fermi.Options.set("reference", "uhf")
             Fermi.Options.set("charge", uhf_boys[i][3])
             Fermi.Options.set("multiplicity", uhf_boys[i][4])
+            Fermi.Options.set("uhf_alg", 1)
 
             wf = @energy uhf
             @test isapprox(wf.energy, Edf[i], rtol=tol) # Energy from Psi4
+
+            # Direct (integral-direct DF) should agree with the in-core DF energy above
+            Fermi.Options.set("uhf_alg", 2)
+            wf = @energy uhf
+            @test isapprox(wf.energy, Edf[i], rtol=tol) # Energy from Psi4
+            Fermi.Options.set("uhf_alg", 1)
         end
     end
 

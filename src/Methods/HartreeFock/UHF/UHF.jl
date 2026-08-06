@@ -52,6 +52,12 @@ include("UHFHelper.jl")
 # And a number is assigned to the implementation
 get_uhf_alg(x::Val{1}) = UHFa()
 
+# Named UHFDirect (not Direct) since RHF and UHF share the same HartreeFock
+# module namespace, and RHF already defines a `Direct <: RHFAlgorithm`.
+struct UHFDirect <: UHFAlgorithm end
+include("Direct.jl")
+get_uhf_alg(x::Val{2}) = UHFDirect()
+
 # Gradient methods
 include("Gradients/UHFgrad.jl")
 
