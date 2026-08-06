@@ -86,7 +86,11 @@ function calcJK!(J, K, D, ints::IntegralHelper{Float64,<:SparseERI,AtomicOrbital
     # Streaming worker-pool: each task owns its own local Jt/Kt buffers and pulls
     # work off a shared queue, instead of indexing a per-thread array by
     # Threads.threadid() (unsafe under task migration / dynamic scheduling).
-    chunksize = 1
+    # chunksize=1 used to mean one Vector{Int} (and one Channel put!) per single
+    # sparse ERI element -- for eri_vals in the millions that's millions of tiny
+    # allocations before any Fock-build work starts. Batching amortizes that away
+    # while keeping nchunks well above ntasks for load balancing.
+    chunksize = clamp(cld(length(eri_vals), 50*Threads.nthreads()), 1, 1000)
     ntasks = Threads.nthreads()
 
     chunks = [collect(chunk) for chunk in Iterators.partition(eachindex(eri_vals), chunksize)]
