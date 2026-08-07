@@ -228,15 +228,30 @@ using TensorOperations
     end
 
     @testset "@hessian macro and vibrational_analysis" begin
+        # Harmonic vibrational analysis via simple mass-weighted projection is
+        # only rigorously defined AT a stationary point (zero gradient) --
+        # away from one, translation/rotation contaminate the Hessian in a
+        # way projection doesn't fully remove, and even Psi4's own frequency
+        # routine visibly breaks (it explicitly warns "Vibrations include
+        # un-projected rotation-like modes" and reports spurious large
+        # imaginary frequencies) if you feed it a non-equilibrium geometry.
+        # So: optimize first, matching what any real use of this would do.
         Fermi.Options.set("molstring", """
         O   0.000000000000   0.000000000000   0.000000000000
         H   0.758602190000   0.000000000000   0.504284980000
         H   0.758602190000   0.000000000000  -0.504284980000
         """)
         Fermi.Options.set("basis", "sto-3g")
-        wf = @energy rhf
-        H = @hessian wf => rhf
+        Fermi.Options.set("geom_e_conv", 1e-10)
+        Fermi.Options.set("geom_grms_conv", 1e-9)
+        Fermi.Options.set("geom_gmax_conv", 1e-9)
+        Fermi.Options.set("geom_drms_conv", 1e-8)
+        Fermi.Options.set("geom_dmax_conv", 1e-8)
+        Fermi.Options.set("geom_max_iter", 100)
+        wf = @optimize rhf
+        @test maximum(abs.(Fermi.HartreeFock.RHFgrad(wf))) < 1e-8
 
+        H = @hessian wf => rhf
         freqs, modes = vibrational_analysis(H, wf.molecule)
 
         # 6 translation/rotation modes (nonlinear triatomic) should be
@@ -244,11 +259,14 @@ using TensorOperations
         @test count(f -> abs(f) < 1.0, freqs) == 6
 
         vib_freqs = sort(filter(f -> abs(f) >= 1.0, freqs))
-        # Cross-validated independently: matches an from-scratch numpy
-        # reimplementation of mass-weighting+projection+diagonalization
-        # applied to Psi4's own (already Hessian-matrix-validated) result,
-        # to ~0.5 cm^-1 (consistent with the ~1e-8 Fermi/Psi4 Hessian gap).
-        @test vib_freqs ≈ [2400.9613, 5156.3764, 5540.6078] atol=1.0
+        # Reference: Psi4 1.10 `frequencies('scf')`, sto-3g, at this exact
+        # (Fermi-optimized) geometry -- Psi4's own TR/V labeling comes out
+        # clean here (unlike at a non-stationary geometry), confirming this
+        # is the right kind of test. atol=1.0 cm^-1 comfortably covers the
+        # ~0.2-0.4 cm^-1 residual expected from ordinary cross-code numerical
+        # noise (integral thresholds, summation order, etc.) at this level of
+        # agreement -- already essentially machine-converged (gradient <1e-8).
+        @test vib_freqs ≈ [2170.04597272, 4140.00188775, 4391.06663761] atol=1.0
 
         # Linear molecule sanity check: only 5 (not 6) trans/rot zero modes,
         # since rotation about the molecular axis isn't a physical DOF.
