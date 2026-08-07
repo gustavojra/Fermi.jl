@@ -2,6 +2,7 @@ using Fermi.DIIS
 
 using TensorOperations
 using LinearAlgebra
+using KrylovKit
 using Format
 import Base: show
 
@@ -122,6 +123,7 @@ include("Gradients/RHFgrad.jl")
 
 # Hessian methods
 include("Hessians/TwoElectronHess.jl")
+include("Hessians/CPHF.jl")
 
 ### MISCELLANEOUS
 # Pretty printing

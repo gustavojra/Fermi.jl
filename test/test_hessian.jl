@@ -1,5 +1,6 @@
 using GaussianBasis
 using Molecules
+using TensorOperations
 
 @reset
 @set printstyle none
@@ -53,6 +54,120 @@ using Molecules
                      0.25 .* FD2(bs_->E2_exchange(bs_,P), bset, iA, iB)
             @test H2e_analytic ≈ H2e_FD atol=1e-4
         end
+    end
+
+    @testset "CPHF response-Fock matrix-vector product" begin
+        # Validates cphf_Amatvec (the CPHF coupling matrix's action A*U) against
+        # a brute-force dense MO-ERI contraction of sum_bj[4(ai|bj)-(ab|ij)-(aj|ib)]U_bj,
+        # a structurally independent computation (explicit AO->MO transform of the
+        # full ERI tensor, not the build_fock!-reuse trick cphf_Amatvec relies on).
+        path = joinpath(@__DIR__, "xyz/water.xyz")
+        mol = open(f->read(f,String), path)
+
+        Fermi.Options.set("molstring", mol)
+        Fermi.Options.set("basis", "sto-3g")
+
+        wf = @energy rhf
+        ndocc = wf.ndocc
+        nbas = size(wf.orbitals.C, 1)
+        nvir = nbas - ndocc
+        C = wf.orbitals.C
+        Co = C[:, 1:ndocc]
+        Cv = C[:, ndocc+1:end]
+
+        ints = Fermi.Integrals.IntegralHelper(molecule=wf.molecule, eri_type=Fermi.Integrals.Chonky())
+        eri_ao = ints["ERI"]
+
+        function mo_eri(eri_ao, Ca, Cb, Cc, Cd)
+            @tensoropt eri_mo[a,b,c,d] := Ca[m,a]*Cb[n,b]*Cc[r,c]*Cd[s,d]*eri_ao[m,n,r,s]
+            return eri_mo
+        end
+
+        eri_aibj = mo_eri(eri_ao, Cv, Co, Cv, Co)
+        eri_abij = mo_eri(eri_ao, Cv, Cv, Co, Co)
+        eri_ajib = mo_eri(eri_ao, Cv, Co, Co, Cv)
+
+        # deterministic pseudo-random trial matrix (avoids a Random stdlib
+        # test-dependency for what only needs to be "generic, not special")
+        U = [sin(1.3*a + 2.7*i) for a in 1:nvir, i in 1:ndocc]
+
+        AU_brute = zeros(nvir, ndocc)
+        for a in 1:nvir, i in 1:ndocc
+            s = 0.0
+            for b in 1:nvir, j in 1:ndocc
+                s += (4*eri_aibj[a,i,b,j] - eri_abij[a,b,i,j] - eri_ajib[a,j,i,b]) * U[b,j]
+            end
+            AU_brute[a,i] = s
+        end
+
+        AU_fast = Fermi.HartreeFock.cphf_Amatvec(U, Co, Cv, ints)
+        @test AU_fast ≈ AU_brute atol=1e-10
+    end
+
+    @testset "CPHF orbital response (finite difference of the SCF density)" begin
+        # The definitive CPHF check: does the analytic dD/dy built from the
+        # CPHF-solved U actually match how the *real*, re-converged SCF
+        # density changes under a geometry displacement? This is independent
+        # of every other test here -- it reruns full SCF at displaced
+        # geometries rather than reusing any of cphf_rhs/cphf_Amatvec's own
+        # machinery.
+        path = joinpath(@__DIR__, "xyz/water.xyz")
+        mol = open(f->read(f,String), path)
+        basis = "sto-3g"
+
+        Fermi.Options.set("molstring", mol)
+        Fermi.Options.set("basis", basis)
+        wf = @energy rhf
+
+        ndocc = wf.ndocc
+        C = wf.orbitals.C
+        Co = C[:, 1:ndocc]
+        Cv = C[:, ndocc+1:end]
+        bset = GaussianBasis.BasisSet(wf.orbitals.basis, wf.molecule.atoms)
+        ints = Fermi.Integrals.IntegralHelper(molecule=wf.molecule, eri_type=Fermi.Integrals.Chonky())
+        atoms = wf.molecule.atoms
+
+        function displaced_molstring(atoms, iA, k, delta)
+            newatoms = deepcopy(atoms)
+            xyz = collect(newatoms[iA].xyz)
+            xyz[k] += delta
+            newatoms[iA] = Molecules.Atom(newatoms[iA].Z, newatoms[iA].mass, xyz)
+            return join(["$(Int(a.Z))   $(a.xyz[1])   $(a.xyz[2])   $(a.xyz[3])" for a in newatoms], "\n")
+        end
+
+        function scf_D(molstring)
+            Fermi.Options.set("molstring", molstring)
+            Fermi.Options.set("basis", basis)
+            wf_ = @energy rhf
+            Co_ = wf_.orbitals.C[:, 1:wf_.ndocc]
+            return Co_ * Co_'
+        end
+
+        B2A = Molecules.bohr_to_angstrom
+        h = 5e-4
+
+        for iA in 1:length(atoms)
+            U = Fermi.HartreeFock.cphf_solve(wf, ints, iA)
+
+            ∂S = zeros(size(Co, 1), size(Co, 1), 3)
+            GaussianBasis.∇overlap!(∂S, bset, iA)
+
+            for q in 1:3
+                Dp = scf_D(displaced_molstring(atoms, iA, q, h))
+                Dm = scf_D(displaced_molstring(atoms, iA, q, -h))
+                dD_FD = (Dp .- Dm) ./ (2h / B2A)
+
+                ΔD = Cv * U[:, :, q] * Co'
+                ΔD .+= ΔD'
+                S_oo = Co' * (@view ∂S[:, :, q]) * Co
+                dD_analytic = ΔD .- Co * S_oo * Co'
+
+                @test dD_analytic ≈ dD_FD atol=1e-5
+            end
+        end
+
+        Fermi.Options.set("molstring", mol)
+        Fermi.Options.set("basis", basis)
     end
 end
 
