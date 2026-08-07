@@ -24,5 +24,6 @@ tol = 1E-8
     #include("test_pT.jl")
     include("test_fci.jl")
     include("test_tools.jl")
+    include("test_hessian.jl")
     @reset
 end

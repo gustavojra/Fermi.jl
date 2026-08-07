@@ -120,6 +120,9 @@ get_rhf_alg(x::Val{2}) = Direct()
 # Gradient methods
 include("Gradients/RHFgrad.jl")
 
+# Hessian methods
+include("Hessians/TwoElectronHess.jl")
+
 ### MISCELLANEOUS
 # Pretty printing
 function string_repr(X::RHF)
