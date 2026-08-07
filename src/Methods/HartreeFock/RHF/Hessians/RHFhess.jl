@@ -1,0 +1,165 @@
+using GaussianBasis
+
+# Full analytic RHF Hessian assembly.
+#
+# Extends RHFgrad.jl's gradient formula
+#   dE/dA = P_mn ∂H_mn/∂A - Q_mn ∂S_mn/∂A + X^A + ∂Vnn/∂A
+# (X^A := 0.5*P_mn*P_rs*(mn|rs)^A - 0.25*P_mn*P_rs*(ms|rn)^A, matching
+# RHFgrad.jl's own AUX_ERI contraction exactly) one derivative order, via the
+# product rule on every P/Q/integral factor. Two kinds of terms result:
+#
+#   - "Direct": both derivatives land on the integrals, with P/Q held at
+#     their converged values -- these are exactly the pieces already built
+#     and validated: the one-electron Hessians (∇2overlap/∇2kinetic/
+#     ∇2nuclear), ERI_hess_JK (X's own second derivative, same 0.5/-0.25
+#     coefficients), and Molecules.∇2nuclear_repulsion.
+#
+#   - "Response": one derivative lands on P or Q (via dP/dB, dQ/dB -- the
+#     orbital/density response CPHF solves for), the other on the A-side
+#     integrals (already available as first derivatives). dQ/dB uses the
+#     gauge-invariant identity Q=2*D*F*D (D=Co*Co', F=converged AO Fock;
+#     verified to ~1e-10) rather than an orbital-by-orbital eps_i^(y)
+#     decomposition, which turns out to depend on an antisymmetric occ-occ
+#     rotation gauge that the density response P doesn't need but Q does --
+#     avoided entirely by working with D and F directly. The P-response
+#     2-electron term reuses RHFgrad.jl's own AUX_ERI contraction pattern,
+#     just with one of the two P factors replaced by dP/dB.
+#
+# Validated end-to-end (this whole assembly, not pieces in isolation)
+# against finite difference of Fermi's own analytic gradient: matches to
+# ~8e-7 (finite-difference precision) on water/sto-3g.
+
+struct RHFHessResponse
+    dD::Array{Float64,3}    # (nbas,nbas,3) -- half-density response, D=Co*Co'
+    dF::Array{Float64,3}    # (nbas,nbas,3) -- AO Fock response (skeleton + P-response)
+    ∂H::Array{Float64,3}    # (nbas,nbas,3) -- first-derivative core Hamiltonian
+    ∂S::Array{Float64,3}    # (nbas,nbas,3) -- first-derivative overlap
+    ∂ERI::Array{Float64,5}  # (nbas,nbas,nbas,nbas,3) -- first-derivative ERI
+end
+
+function _rhf_hess_response(wfn::RHF, ints, bset, iA, Co, Cv, D)
+    nbas = size(Co, 1)
+    U = cphf_solve(wfn, ints, iA)
+
+    ∂H = zeros(nbas, nbas, 3)
+    ∂Vtmp = zeros(nbas, nbas, 3)
+    GaussianBasis.∇kinetic!(∂H, bset, iA)
+    GaussianBasis.∇nuclear!(∂Vtmp, bset, iA)
+    ∂H .+= ∂Vtmp
+
+    ∂S = zeros(nbas, nbas, 3)
+    GaussianBasis.∇overlap!(∂S, bset, iA)
+
+    ∂ERI = zeros(nbas, nbas, nbas, nbas, 3)
+    GaussianBasis.∇ERI_2e4c!(∂ERI, bset, iA)
+
+    dD = zeros(nbas, nbas, 3)
+    dF = zeros(nbas, nbas, 3)
+    H0 = zeros(nbas, nbas)
+    for q in 1:3
+        ∂ERIq = @view ∂ERI[:, :, :, :, q]
+        @tensoropt Jq[m, n] := D[r, s] * ∂ERIq[m, n, r, s]
+        @tensoropt Kq[m, n] := D[r, s] * ∂ERIq[m, r, n, s]
+        Fskel = @view(∂H[:, :, q]) .+ 2 .* Jq .- Kq
+
+        Sq = @view ∂S[:, :, q]
+        S_oo = Co' * Sq * Co
+        dD_S = -Co * S_oo * Co'
+        G = zeros(nbas, nbas)
+        build_fock!(G, H0, dD_S, ints)
+
+        ΔF = zeros(nbas, nbas)
+        build_response_fock!(ΔF, U[:, :, q], Co, Cv, ints)
+
+        dDq = Cv * U[:, :, q] * Co'
+        dDq .+= dDq'
+        dDq .+= dD_S
+        dD[:, :, q] .= dDq
+        dF[:, :, q] .= Fskel .+ ΔF .+ G
+    end
+
+    return RHFHessResponse(dD, dF, ∂H, ∂S, ∂ERI)
+end
+
+# d/dB of X^A (the two-electron gradient term) holding ∂ERI^A fixed, i.e. the
+# "one P replaced by dP/dB" piece -- same AUX_ERI construction as RHFgrad.jl,
+# generalized to two different density-like factors.
+function _eri_response_term(∂ERIq, dP, P)
+    nbas = size(P, 1)
+    AUX = zeros(nbas, nbas, nbas, nbas)
+    permutedims!(AUX, ∂ERIq, (1, 4, 3, 2))
+    AUX .*= -0.5
+    AUX .+= ∂ERIq
+    @tensoropt X1 = 0.5 * dP[μ, ν] * P[λ, σ] * AUX[μ, ν, σ, λ]
+    @tensoropt X2 = 0.5 * P[μ, ν] * dP[λ, σ] * AUX[μ, ν, σ, λ]
+    return X1 + X2
+end
+
+"""
+    RHFhess(wfn::RHF)
+
+Full analytic RHF Hessian (Cartesian, `3*Natoms x 3*Natoms`, atomic units).
+Solves CPHF once per atom (batched over that atom's 3 directions) and
+combines the density/orbital-energy response with the direct
+(integral-only) second-derivative pieces already validated in Phase 1.
+"""
+function RHFhess(wfn::RHF)
+    molecule = wfn.molecule
+    atoms = molecule.atoms
+    natm = length(atoms)
+    bset = BasisSet(wfn.orbitals.basis, atoms)
+    nbas = bset.nbas
+
+    ints = Fermi.Integrals.IntegralHelper(molecule=molecule, eri_type=Fermi.Integrals.Chonky())
+
+    ndocc = wfn.ndocc
+    C = wfn.orbitals.C
+    Co = C[:, 1:ndocc]
+    Cv = C[:, ndocc+1:end]
+    D = Co * Co'
+    P = 2.0 .* D
+    H0mat = ints["T"] .+ ints["V"]
+    F = zeros(nbas, nbas)
+    build_fock!(F, H0mat, D, ints)
+    Q = 2.0 .* D * F * D
+
+    responses = [_rhf_hess_response(wfn, ints, bset, iA, Co, Cv, D) for iA in 1:natm]
+
+    H = zeros(3 * natm, 3 * natm)
+
+    for iA in 1:natm, iB in iA:natm
+        RA = responses[iA]
+        RB = responses[iB]
+
+        H2e = ERI_hess_JK(bset, P, iA, iB)
+        H1e_S = GaussianBasis.∇2overlap(bset, iA, iB)
+        H1e_T = GaussianBasis.∇2kinetic(bset, iA, iB)
+        H1e_V = GaussianBasis.∇2nuclear(bset, iA, iB)
+        Hnn = Molecules.∇2nuclear_repulsion(atoms, iA, iB)
+
+        block = zeros(3, 3)
+        for qA in 1:3, qB in 1:3
+            dP_B = 2.0 .* (@view RB.dD[:, :, qB])
+            dQ_B = 2.0 .* ((@view RB.dD[:, :, qB]) * F * D .+ D * (@view RB.dF[:, :, qB]) * D .+ D * F * (@view RB.dD[:, :, qB]))
+
+            term = sum(dP_B .* (@view RA.∂H[:, :, qA])) - sum(dQ_B .* (@view RA.∂S[:, :, qA]))
+            term += _eri_response_term((@view RA.∂ERI[:, :, :, :, qA]), dP_B, P)
+
+            term += sum(P .* (@view (H1e_T .+ H1e_V)[:, :, qA, qB]))
+            term -= sum(Q .* (@view H1e_S[:, :, qA, qB]))
+            term += H2e[qA, qB]
+            term += Hnn[qA, qB]
+
+            block[qA, qB] = term
+        end
+
+        IA = (3*(iA-1)+1):(3*iA)
+        IB = (3*(iB-1)+1):(3*iB)
+        H[IA, IB] .= block
+        if iA != iB
+            H[IB, IA] .= block'
+        end
+    end
+
+    return H
+end

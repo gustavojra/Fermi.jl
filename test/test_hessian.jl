@@ -169,6 +169,63 @@ using TensorOperations
         Fermi.Options.set("molstring", mol)
         Fermi.Options.set("basis", basis)
     end
+
+    @testset "Full RHF Hessian (finite difference of the gradient, and Psi4)" begin
+        Fermi.Options.set("molstring", """
+        O   0.000000000000   0.000000000000   0.000000000000
+        H   0.758602190000   0.000000000000   0.504284980000
+        H   0.758602190000   0.000000000000  -0.504284980000
+        """)
+        basis = "sto-3g"
+        Fermi.Options.set("basis", basis)
+        wf = @energy rhf
+        H = Fermi.HartreeFock.RHFhess(wf)
+
+        @test H ≈ H' atol=1e-10
+
+        # Reference from Psi4 1.10 (`hessian('scf')`, basis sto-3g, this exact
+        # geometry, noreorient/nocom so the atom/axis ordering matches).
+        H_psi4 = [
+            1.13060065634761   0.0                0.0               -0.56530032817424   0.0               -0.44471126604731  -0.56530032817424   0.0                0.44471126604731
+            0.0               -0.07707295928527   0.0                0.0                0.03853647964198   0.0                0.0                0.03853647964198   0.0
+            0.0                0.0                0.61840092098178  -0.52310501956430   0.0               -0.30920046049119   0.52310501956430   0.0               -0.30920046049119
+           -0.56530032817424   0.0               -0.52310501956430   0.56393084645098   0.0                0.48390814280581   0.00136948172326   0.0                0.03919687675849
+            0.0                0.03853647964198   0.0                0.0               -0.13144426267318   0.0                0.0                0.09290778303120   0.0
+           -0.44471126604731   0.0               -0.30920046049119   0.48390814280581   0.0                0.53179651540804  -0.03919687675849   0.0               -0.22259605491685
+           -0.56530032817424   0.0                0.52310501956430   0.00136948172326   0.0               -0.03919687675849   0.56393084645098   0.0               -0.48390814280581
+            0.0                0.03853647964198   0.0                0.0                0.09290778303120   0.0                0.0               -0.13144426267318   0.0
+            0.44471126604731   0.0               -0.30920046049119   0.03919687675849   0.0               -0.22259605491685  -0.48390814280581   0.0                0.53179651540804
+        ]
+        @test H ≈ H_psi4 atol=1e-6
+
+        # Independent check: finite difference of Fermi's own analytic gradient.
+        function displaced_molstring(atoms, iA, k, delta)
+            newatoms = deepcopy(atoms)
+            xyz = collect(newatoms[iA].xyz)
+            xyz[k] += delta
+            newatoms[iA] = Molecules.Atom(newatoms[iA].Z, newatoms[iA].mass, xyz)
+            return join(["$(Int(a.Z))   $(a.xyz[1])   $(a.xyz[2])   $(a.xyz[3])" for a in newatoms], "\n")
+        end
+
+        function scf_grad(molstring)
+            Fermi.Options.set("molstring", molstring)
+            Fermi.Options.set("basis", basis)
+            wf_ = @energy rhf
+            return Fermi.HartreeFock.RHFgrad(wf_)
+        end
+
+        atoms = wf.molecule.atoms
+        natm = length(atoms)
+        B2A = Molecules.bohr_to_angstrom
+        h = 5e-4
+        H_FD = zeros(3*natm, 3*natm)
+        for iB in 1:natm, qB in 1:3
+            gp = scf_grad(displaced_molstring(atoms, iB, qB, h))
+            gm = scf_grad(displaced_molstring(atoms, iB, qB, -h))
+            H_FD[:, 3*(iB-1)+qB] .= vec(((gp .- gm) ./ (2h/B2A))')
+        end
+        @test H ≈ H_FD atol=1e-5
+    end
 end
 
 @reset

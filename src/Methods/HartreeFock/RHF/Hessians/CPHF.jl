@@ -161,11 +161,14 @@ function cphf_solve(wfn::RHF, ints, iA)
     eps = wfn.orbitals.eps
     Δeps = eps[ndocc+1:end] .- eps[1:ndocc]'  # (nvir,ndocc), εa - εi
 
+    maxiter = Options.get("cphf_max_iter")
+    tol = Options.get("cphf_conv")
+
     B = cphf_rhs(wfn, ints, iA)
     U = zeros(nvir, ndocc, 3)
     for q in 1:3
         matvec(x) = Δeps .* x .+ cphf_Amatvec(x, Co, Cv, ints)
-        sol, info = KrylovKit.linsolve(matvec, -B[:, :, q], zeros(nvir, ndocc), KrylovKit.CG())
+        sol, info = KrylovKit.linsolve(matvec, -B[:, :, q], zeros(nvir, ndocc), KrylovKit.CG(; maxiter=maxiter, tol=tol))
         U[:, :, q] .= sol
     end
     return U
