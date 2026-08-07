@@ -36,5 +36,6 @@ include("Tools/SinglePointEnergy.jl")
 include("Tools/FiniteDifferences.jl")
 include("Tools/Gradients.jl")
 include("Tools/GeometryOptimization.jl")
+include("Tools/Hessians.jl")
 
 end # module

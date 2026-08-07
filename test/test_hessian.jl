@@ -226,6 +226,41 @@ using TensorOperations
         end
         @test H ≈ H_FD atol=1e-5
     end
+
+    @testset "@hessian macro and vibrational_analysis" begin
+        Fermi.Options.set("molstring", """
+        O   0.000000000000   0.000000000000   0.000000000000
+        H   0.758602190000   0.000000000000   0.504284980000
+        H   0.758602190000   0.000000000000  -0.504284980000
+        """)
+        Fermi.Options.set("basis", "sto-3g")
+        wf = @energy rhf
+        H = @hessian wf => rhf
+
+        freqs, modes = vibrational_analysis(H, wf.molecule)
+
+        # 6 translation/rotation modes (nonlinear triatomic) should be
+        # essentially zero; the remaining 3 are the genuine vibrations.
+        @test count(f -> abs(f) < 1.0, freqs) == 6
+
+        vib_freqs = sort(filter(f -> abs(f) >= 1.0, freqs))
+        # Cross-validated independently: matches an from-scratch numpy
+        # reimplementation of mass-weighting+projection+diagonalization
+        # applied to Psi4's own (already Hessian-matrix-validated) result,
+        # to ~0.5 cm^-1 (consistent with the ~1e-8 Fermi/Psi4 Hessian gap).
+        @test vib_freqs ≈ [2400.9613, 5156.3764, 5540.6078] atol=1.0
+
+        # Linear molecule sanity check: only 5 (not 6) trans/rot zero modes,
+        # since rotation about the molecular axis isn't a physical DOF.
+        Fermi.Options.set("molstring", """
+        N   0.000000000000   0.000000000000   0.000000000000
+        N   0.000000000000   0.000000000000   1.100000000000
+        """)
+        wf_n2 = @energy rhf
+        H_n2 = @hessian wf_n2 => rhf
+        freqs_n2, _ = vibrational_analysis(H_n2, wf_n2.molecule)
+        @test count(f -> abs(f) < 1.0, freqs_n2) == 5
+    end
 end
 
 @reset
