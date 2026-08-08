@@ -107,7 +107,23 @@ function RHFhess(wfn::RHF)
 end
 
 """
-    RHFhess(aoints::IntegralHelper, wfn::RHF)
+    RHFhess(aoints::IntegralHelper{Float64,<:AbstractDFERI}, wfn::RHF)
+
+Not yet implemented. `eri_grad_JK` (CPHF's RHS "skeleton" term, and the
+main-loop response reuse below) and `ERI_hess_JK` (the "direct" second-
+derivative term) both unconditionally use exact-ERI GaussianBasis.jl
+routines regardless of `eri_type` -- only CPHF's own coupling-matrix Fock
+builds (`build_fock!`) actually dispatch on it. Silently proceeding would
+mix DF Fock builds with exact-ERI derivatives everywhere else: not a DF
+Hessian, not an exact one, no clear physical meaning. Throws until a real
+DF Hessian lands (see the DF-RHF Analytic Hessian plan).
+"""
+function RHFhess(ints::Fermi.Integrals.IntegralHelper{Float64,<:Fermi.Integrals.AbstractDFERI}, wfn::RHF)
+    throw(FermiException("RHFhess does not yet support density-fitted (DF) eri_types ($(typeof(ints.eri_type))). Use Chonky or SparseERI."))
+end
+
+"""
+    RHFhess(aoints::IntegralHelper{Float64,<:Union{Chonky,SparseERI}}, wfn::RHF)
 
 Full analytic RHF Hessian (Cartesian, `3*Natoms x 3*Natoms`, atomic units).
 Solves CPHF once per atom (batched over that atom's 3 directions) and
@@ -121,7 +137,7 @@ default) is honored rather than a hardcoded dense `Chonky` build, which
 also avoids the O(nbas^4)-per-CG-iteration dense contraction that hardcoding
 Chonky used to force.
 """
-function RHFhess(ints::Fermi.Integrals.IntegralHelper, wfn::RHF)
+function RHFhess(ints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.Integrals.Chonky,Fermi.Integrals.SparseERI}}, wfn::RHF)
     molecule = wfn.molecule
     atoms = molecule.atoms
     natm = length(atoms)
