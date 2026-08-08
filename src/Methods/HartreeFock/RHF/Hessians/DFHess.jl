@@ -337,3 +337,127 @@ function ERI_hess_JK_df(cache, P::AbstractMatrix, iA::Int, iB::Int)
 
     return H
 end
+
+# --- Phase 5: assembly / top-level dispatch ---
+#
+# DF analog of RHFhess.jl's main assembly loop -- same formula, same
+# RHFHessResponse struct (defined in RHFhess.jl, included before this file),
+# just built from cphf_solve_df/eri_grad_JK_df instead of
+# cphf_solve/eri_grad_JK, and ERI_hess_JK_df instead of ERI_hess_JK for the
+# direct two-electron term. build_fock! (CPHF's own Fock builds, and the
+# skeleton-density G build below) already dispatches on `ints`'s eri_type,
+# so no changes needed there.
+
+function _rhf_hess_response_df(wfn::RHF, ints, cache, iA, Co, Cv)
+    bset = cache.bset
+    nbas = bset.nbas
+    U = cphf_solve_df(wfn, ints, iA, cache)
+
+    ∂H = zeros(nbas, nbas, 3)
+    ∂Vtmp = zeros(nbas, nbas, 3)
+    GaussianBasis.∇kinetic!(∂H, bset, iA)
+    GaussianBasis.∇nuclear!(∂Vtmp, bset, iA)
+    ∂H .+= ∂Vtmp
+
+    ∂S = zeros(nbas, nbas, 3)
+    GaussianBasis.∇overlap!(∂S, bset, iA)
+
+    Jq_all, Kq_all = eri_grad_JK_df(cache, iA)
+
+    dD = zeros(nbas, nbas, 3)
+    dF = zeros(nbas, nbas, 3)
+    H0 = zeros(nbas, nbas)
+    for q in 1:3
+        Fskel = @view(∂H[:, :, q]) .+ 2 .* (@view Jq_all[:, :, q]) .- (@view Kq_all[:, :, q])
+
+        Sq = @view ∂S[:, :, q]
+        S_oo = Co' * Sq * Co
+        dD_S = -Co * S_oo * Co'
+        G = zeros(nbas, nbas)
+        build_fock!(G, H0, dD_S, ints)
+
+        ΔF = zeros(nbas, nbas)
+        build_response_fock!(ΔF, U[:, :, q], Co, Cv, ints)
+
+        dDq = Cv * U[:, :, q] * Co'
+        dDq .+= dDq'
+        dDq .+= dD_S
+        dD[:, :, q] .= dDq
+        dF[:, :, q] .= Fskel .+ ΔF .+ G
+    end
+
+    return RHFHessResponse(dD, dF, ∂H, ∂S, Jq_all, Kq_all)
+end
+
+"""
+    RHFhess(ints::IntegralHelper{Float64,<:AbstractDFERI}, wfn::RHF)
+
+Full analytic DF-RHF Hessian (Cartesian, `3*Natoms x 3*Natoms`, atomic
+units) -- DF analog of `RHFhess`'s exact-ERI dispatch (`RHFhess.jl`), same
+overall assembly (direct integral-response terms + CPHF orbital/density
+response), with every two-electron piece routed through the DF cache
+(`build_df_hess_cache`) instead of dense/sparse exact-ERI machinery. `ints`
+is used directly for CPHF's Fock builds (already DF-dispatching via
+`build_fock!`), and its auxiliary basis (`ints.eri_type.basisset`) supplies
+both the metric and the 3-center integrals throughout.
+"""
+function RHFhess(ints::Fermi.Integrals.IntegralHelper{Float64,<:Fermi.Integrals.AbstractDFERI}, wfn::RHF)
+    molecule = wfn.molecule
+    atoms = molecule.atoms
+    natm = length(atoms)
+
+    cache = build_df_hess_cache(wfn, ints)
+    bset = cache.bset
+    nbas = bset.nbas
+
+    ndocc = wfn.ndocc
+    C = wfn.orbitals.C
+    Co = C[:, 1:ndocc]
+    Cv = C[:, ndocc+1:end]
+    D = Co * Co'
+    P = 2.0 .* D
+    H0mat = ints["T"] .+ ints["V"]
+    F = zeros(nbas, nbas)
+    build_fock!(F, H0mat, D, ints)
+    Q = 2.0 .* D * F * D
+
+    responses = [_rhf_hess_response_df(wfn, ints, cache, iA, Co, Cv) for iA in 1:natm]
+
+    H = zeros(3 * natm, 3 * natm)
+
+    for iA in 1:natm, iB in iA:natm
+        RA = responses[iA]
+        RB = responses[iB]
+
+        H2e = ERI_hess_JK_df(cache, P, iA, iB)
+        H1e_S = GaussianBasis.∇2overlap(bset, iA, iB)
+        H1e_T = GaussianBasis.∇2kinetic(bset, iA, iB)
+        H1e_V = GaussianBasis.∇2nuclear(bset, iA, iB)
+        Hnn = Molecules.∇2nuclear_repulsion(atoms, iA, iB)
+
+        block = zeros(3, 3)
+        for qA in 1:3, qB in 1:3
+            dP_B = 2.0 .* (@view RB.dD[:, :, qB])
+            dQ_B = 2.0 .* ((@view RB.dD[:, :, qB]) * F * D .+ D * (@view RB.dF[:, :, qB]) * D .+ D * F * (@view RB.dD[:, :, qB]))
+
+            term = sum(dP_B .* (@view RA.∂H[:, :, qA])) - sum(dQ_B .* (@view RA.∂S[:, :, qA]))
+            term += 2 * sum(dP_B .* (@view RA.Jq[:, :, qA])) - sum(dP_B .* (@view RA.Kq[:, :, qA]))
+
+            term += sum(P .* (@view (H1e_T .+ H1e_V)[:, :, qA, qB]))
+            term -= sum(Q .* (@view H1e_S[:, :, qA, qB]))
+            term += H2e[qA, qB]
+            term += Hnn[qA, qB]
+
+            block[qA, qB] = term
+        end
+
+        IA = (3*(iA-1)+1):(3*iA)
+        IB = (3*(iB-1)+1):(3*iB)
+        H[IA, IB] .= block
+        if iA != iB
+            H[IB, IA] .= block'
+        end
+    end
+
+    return H
+end

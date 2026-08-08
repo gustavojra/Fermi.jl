@@ -385,6 +385,134 @@ using TensorOperations
         @set printstyle none
     end
 
+    @testset "Full DF-RHF Hessian (finite difference of the DF gradient, and Psi4)" begin
+        # Phase 5 of the DF-RHF analytic Hessian plan: end-to-end assembly
+        # (RHFhess dispatching on an AbstractDFERI aoints), combining the
+        # DF direct term (ERI_hess_JK_df) with CPHF orbital/density response
+        # built from cphf_solve_df/eri_grad_JK_df.
+        #
+        # Aux basis forced to cc-pvtz-jkfit rather than RIFIT's "auto"
+        # fallback (cc-pvqz-rifit for a non-Dunning primary basis like
+        # sto-3g): that fallback is a poor size match for a 7-function
+        # primary basis (242 aux functions), giving a metric condition
+        # number ~7.7e6 that's fine for a first derivative (DFgrad.jl) but
+        # amplifies ordinary cross-run floating-point/threading noise (CG
+        # iteration order, etc.) past 1e-3 once squared through a *second*
+        # derivative and an independently-rebuilt aoints/CPHF solve --
+        # caught by this test itself (both sub-checks below originally
+        # failed at the ~1e-3 level with the auto aux basis, vanishing once
+        # switched to this better-conditioned one).
+        path = joinpath(@__DIR__, "xyz/water.xyz")
+        mol = open(f->read(f,String), path)
+        basis = "sto-3g"
+
+        Fermi.Options.set("molstring", mol)
+        Fermi.Options.set("basis", basis)
+        Fermi.Options.set("df", true)
+        Fermi.Options.set("jkfit", "cc-pvtz-jkfit")
+
+        aoints = Fermi.Integrals.IntegralHelper(eri_type=Fermi.Integrals.JKFIT())
+        wf = Fermi.HartreeFock.RHF(aoints, Fermi.HartreeFock.get_rhf_alg())
+        H = Fermi.HartreeFock.RHFhess(aoints, wf)
+
+        @test H ≈ H' atol=1e-8
+
+        # convenience dispatch (RHFhess(wf), no aoints) must pick the same
+        # DF path automatically via the `df` option -- IntegralHelper's own
+        # default eri_type selection (JKFIT/RIFIT vs Chonky/SparseERI).
+        H_conv = Fermi.HartreeFock.RHFhess(wf)
+        @test H ≈ H_conv atol=1e-8
+
+        # Independent check: finite difference of Fermi's own DF analytic
+        # gradient (DFgrad.jl). Mirrors the exact-ERI "Full RHF Hessian"
+        # test's own FD-of-gradient checkpoint exactly (same water.xyz,
+        # same default angstrom convention -- atoms are re-stringified from
+        # `atoms[iA].xyz`, which Molecules.jl always stores internally in
+        # Angstrom regardless of the original input unit, so no unit needs
+        # to be re-set here).
+        function displaced_molstring(atoms, iA, k, delta)
+            newatoms = deepcopy(atoms)
+            xyz = collect(newatoms[iA].xyz)
+            xyz[k] += delta
+            newatoms[iA] = Molecules.Atom(newatoms[iA].Z, newatoms[iA].mass, xyz)
+            return join(["$(Int(a.Z))   $(a.xyz[1])   $(a.xyz[2])   $(a.xyz[3])" for a in newatoms], "\n")
+        end
+
+        function scf_grad_df(molstring)
+            Fermi.Options.set("molstring", molstring)
+            Fermi.Options.set("basis", basis)
+            Fermi.Options.set("df", true)
+            Fermi.Options.set("jkfit", "cc-pvtz-jkfit")
+            ints_ = Fermi.Integrals.IntegralHelper(eri_type=Fermi.Integrals.JKFIT())
+            wf_ = Fermi.HartreeFock.RHF(ints_, Fermi.HartreeFock.get_rhf_alg())
+            return Fermi.HartreeFock.RHFgrad(ints_, wf_)
+        end
+
+        atoms = wf.molecule.atoms
+        natm = length(atoms)
+        B2A = Molecules.bohr_to_angstrom
+        h = 5e-4
+        H_FD = zeros(3*natm, 3*natm)
+        for iB in 1:natm, qB in 1:3
+            gp = scf_grad_df(displaced_molstring(atoms, iB, qB, h))
+            gm = scf_grad_df(displaced_molstring(atoms, iB, qB, -h))
+            H_FD[:, 3*(iB-1)+qB] .= vec(((gp .- gm) ./ (2h/B2A))')
+        end
+        @test H ≈ H_FD atol=1e-4
+
+        @reset
+        @set printstyle none
+    end
+
+    @testset "Full DF-RHF Hessian vs Psi4" begin
+        # Independent-implementation cross-check (not just finite
+        # difference): Psi4 1.10 `hessian('scf')`, scf_type df, water/sto-3g,
+        # noreorient/nocom so atom/axis ordering matches, this exact
+        # geometry (bohr). Aux basis must match on both sides to be
+        # meaningful -- neither side's "auto" heuristic picks the same
+        # basis (Fermi's RIFIT "auto" defaults to cc-pvqz-rifit for a
+        # non-Dunning primary basis; Psi4's own DF_BASIS_SCF default is a
+        # different heuristic entirely), and Psi4's analytic Hessian engine
+        # rejects aux bases with angular momentum > g (cc-pvqz-jkfit's h
+        # functions raise `lmax_exceeded`) -- so cc-pvtz-jkfit (max L=4) is
+        # forced explicitly on both sides via the `jkfit` option / Psi4's
+        # `df_basis_scf`.
+        Fermi.Options.set("molstring", """
+        O   0.000000000000   0.000000000000  -0.143225816552
+        H   0.000000000000   1.638036840407   1.136548822547
+        H   0.000000000000  -1.638036840407   1.136548822547
+        """)
+        Fermi.Options.set("unit", "bohr")
+        Fermi.Options.set("basis", "sto-3g")
+        Fermi.Options.set("df", true)
+        Fermi.Options.set("jkfit", "cc-pvtz-jkfit")
+        Fermi.Options.set("scf_e_conv", 1e-12)
+        Fermi.Options.set("scf_max_rms", 1e-10)
+        Fermi.Options.set("cphf_conv", 1e-10)
+
+        aoints = Fermi.Integrals.IntegralHelper(eri_type=Fermi.Integrals.JKFIT())
+        wf = Fermi.HartreeFock.RHF(aoints, Fermi.HartreeFock.get_rhf_alg())
+        H = Fermi.HartreeFock.RHFhess(aoints, wf)
+
+        @test H ≈ H' atol=1e-9
+
+        H_psi4 = [
+            0.07613774603504    -0.00000000000000    -0.00000000000000    -0.03806887301680     0.00000000000000     0.00000000000000    -0.03806887301707    -0.00000000000000    -0.00000000000000
+           -0.00000000000000     0.48291234123351    -0.00000000000038     0.00000000000000    -0.24145617061195    -0.15890357222942    -0.00000000000000    -0.24145617062065     0.15890357222497
+           -0.00000000000000    -0.00000000000038     0.43735805543467     0.00000000000000    -0.07344719886939    -0.21867902771937    -0.00000000000000     0.07344719887495    -0.21867902771719
+           -0.03806887301680     0.00000000000000     0.00000000000000     0.04537590838802    -0.00000000000000    -0.00000000000000    -0.00730703537143    -0.00000000000000     0.00000000000000
+            0.00000000000000    -0.24145617061195    -0.07344719886939    -0.00000000000000     0.25786921957443     0.11617538555496    -0.00000000000000    -0.01641304895170    -0.04272818667789
+            0.00000000000000    -0.15890357222942    -0.21867902771937    -0.00000000000000     0.11617538555496     0.19775552422997    -0.00000000000000     0.04272818667623     0.02092350348770
+           -0.03806887301707    -0.00000000000000    -0.00000000000000    -0.00730703537143    -0.00000000000000    -0.00000000000000     0.04537590838906     0.00000000000000     0.00000000000000
+           -0.00000000000000    -0.24145617062065     0.07344719887495    -0.00000000000000    -0.01641304895170     0.04272818667623     0.00000000000000     0.25786921956403    -0.11617538554872
+           -0.00000000000000     0.15890357222497    -0.21867902771719     0.00000000000000    -0.04272818667789     0.02092350348770     0.00000000000000    -0.11617538554872     0.19775552423506
+        ]
+        @test H ≈ H_psi4 atol=1e-5
+
+        @reset
+        @set printstyle none
+    end
+
     @testset "Full RHF Hessian (finite difference of the gradient, and Psi4)" begin
         Fermi.Options.set("molstring", """
         O   0.000000000000   0.000000000000   0.000000000000
