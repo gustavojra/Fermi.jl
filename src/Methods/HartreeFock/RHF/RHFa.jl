@@ -1,11 +1,13 @@
 using GaussianBasis
 
 function RHF(Alg::A) where A <: RHFAlgorithm
+    warn_no_aoints()
     ints = IntegralHelper{Float64}()
     RHF(ints, Alg)
 end
 
 function RHF(mol::Molecule, Alg::A) where A <: RHFAlgorithm
+    warn_no_aoints()
     RHF(IntegralHelper{Float64}(molecule=mol), Alg)
 end
 
@@ -42,6 +44,7 @@ function RHF(wfn::RHF, Alg::A) where A <: RHFAlgorithm
     output("Using {} wave function as initial guess", wfn.orbitals.basis)
 
     # B = target basis set
+    warn_no_aoints()
     intsB = IntegralHelper{Float64}()
 
     # Assert both A and B have the same molecule.

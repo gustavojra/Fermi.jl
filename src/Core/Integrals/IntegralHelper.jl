@@ -16,7 +16,7 @@ import Fermi: string_repr
 import Base: getindex, setindex!, delete!, show
 import GaussianBasis: BasisSet
 
-export IntegralHelper, delete!, mo_from_ao!
+export IntegralHelper, delete!, mo_from_ao!, warn_no_aoints
 export BasisSet, BasisFunction
 
 # Expand BasisSet methods to handle molecules.
@@ -116,6 +116,24 @@ function getindex(I::IntegralHelper, entry::String)
         compute!(I, entry)
         return I.cache[entry]
     end
+end
+
+"""
+    warn_no_aoints()
+
+Conspicuous warning printed by RHF/RHFgrad/RHFhess's aoints-free entry points
+right before they build a throwaway `IntegralHelper` internally -- build one
+yourself and thread it through (e.g. `aoints => rhf`, `aoints, wfn => rhf`)
+to avoid recomputing atomic integrals across chained `@energy`/`@gradient`/
+`@hessian` calls at the same geometry.
+"""
+function warn_no_aoints()
+    output("\n ⚠️  Atomic integrals not supplied -- computing them from scratch.")
+    output("    To reuse them across @energy/@gradient/@hessian calls, build one")
+    output("    yourself and pass it through, e.g.:")
+    output("      aoints = Fermi.Integrals.IntegralHelper()")
+    output("      wfn    = @energy aoints => rhf")
+    output("      grad   = @gradient aoints, wfn => rhf\n")
 end
 
 function setindex!(I::IntegralHelper, A::AbstractArray, key::String)

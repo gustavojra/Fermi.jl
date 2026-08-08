@@ -23,6 +23,19 @@ Generating a RHF Hessian
 Returns the raw Cartesian Hessian (`3*Natoms x 3*Natoms` matrix, atomic units) -- pass it to
 `vibrational_analysis` for mass-weighting, projection, and a frequency table.
 
+`@hessian` requires a wave function (`@hessian wfn => rhf`) -- there is no bare
+`@hessian rhf` form. Without an `aoints` (`IntegralHelper`), it builds one
+internally and prints a warning, since CPHF's Fock builds genuinely need
+atomic integrals and this throws away any that were already computed for
+`wfn`. To avoid the rebuild -- especially useful right after `@optimize`,
+which already has one live at the converged geometry -- pass `aoints` in
+directly:
+```
+aoints = Fermi.Integrals.IntegralHelper()
+wfn = @energy aoints => rhf
+hess = @hessian aoints, wfn => rhf
+```
+
 # Implemented methods:
     Method   Description
     ------   -----------

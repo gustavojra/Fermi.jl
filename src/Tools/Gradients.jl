@@ -15,8 +15,14 @@ g_dict = Dict{String, String}(
     Fermi.@gradient
 
 Macro to call functions to compute gradients given current options. Arguments may be passed
-using "=>" or "<=" for analytic gradients. The derivative type (analytic, findif, autodif) 
-can be set with `@set deriv_type <kw>`.
+using "=>" or "<=" for analytic gradients. `@set deriv_type <kw>` controls how the gradient
+is obtained:
+
+    "auto"      (default) Analytic if the method implements one (currently only RHF),
+                otherwise finite differences. Never errors due to missing analytic support.
+    "analytic"  Force analytic. Throws if the method has no analytic gradient.
+    "findif"    Force finite differences, even for methods with an analytic gradient
+                available (e.g. to cross-check RHF's analytic gradient).
 
 # Examples
 
@@ -25,7 +31,7 @@ Generating a RHF gradient
 @gradient rhf
 ```
 
-By default, gradients are calculated using the current `molstring`, but `Molecule` objects 
+By default, gradients are calculated using the current `molstring`, but `Molecule` objects
 can also be passed to the gradients
 ```
 mol = Molecule(molstring=mymol)
@@ -34,6 +40,17 @@ mol = Molecule(molstring=mymol)
 or
 ```
 @gradient rhf <= mol
+```
+
+A bare `@gradient rhf` (or `mol => rhf`) has no atomic integrals (`aoints`) to
+reuse, so it builds one internally and prints a warning before doing so. To
+avoid recomputing atomic integrals when you already have a wave function and/or
+an `IntegralHelper` at the same geometry (e.g. right after `@energy`), pass
+them in directly:
+```
+aoints = Fermi.Integrals.IntegralHelper()
+wfn = @energy aoints => rhf
+grad = @gradient aoints, wfn => rhf
 ```
 
 # Implemented methods:

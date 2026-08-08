@@ -34,6 +34,13 @@ using GaussianBasis
 # Validated end-to-end (this whole assembly, not pieces in isolation)
 # against finite difference of Fermi's own analytic gradient: matches to
 # ~8e-7 (finite-difference precision) on water/sto-3g.
+#
+# CPHF's own Fock builds (cphf_Amatvec/build_response_fock!, one per CG
+# iteration) go through `ints`'s own eri_type dispatch (build_fock!'s
+# Chonky/SparseERI/DF cases) rather than a hardcoded dense Chonky build --
+# RHFhess(wfn) builds a throwaway aoints (SparseERI by default, matching
+# what RHF itself defaults to) with a warning; RHFhess(aoints, wfn) reuses
+# a caller-supplied one, e.g. straight out of `@energy aoints => rhf`.
 
 struct RHFHessResponse
     dD::Array{Float64,3}  # (nbas,nbas,3) -- half-density response, D=Co*Co'
@@ -87,19 +94,39 @@ end
 """
     RHFhess(wfn::RHF)
 
+Aoints-free convenience entry point: builds a throwaway `IntegralHelper` for
+`wfn`'s molecule/basis (warning first, see `warn_no_aoints`) and delegates to
+`RHFhess(aoints, wfn)`. Prefer building `aoints` yourself and calling that
+directly (`@hessian aoints, wfn => rhf`) when chaining `@energy`/`@gradient`/
+`@hessian` at the same geometry -- CPHF's Fock builds genuinely reuse it.
+"""
+function RHFhess(wfn::RHF)
+    Fermi.Integrals.warn_no_aoints()
+    aoints = Fermi.Integrals.IntegralHelper(molecule=wfn.molecule, basis=wfn.orbitals.basis)
+    RHFhess(aoints, wfn)
+end
+
+"""
+    RHFhess(aoints::IntegralHelper, wfn::RHF)
+
 Full analytic RHF Hessian (Cartesian, `3*Natoms x 3*Natoms`, atomic units).
 Solves CPHF once per atom (batched over that atom's 3 directions) and
 combines the density/orbital-energy response with the direct
 (integral-only) second-derivative pieces already validated in Phase 1.
+
+`aoints` is used directly for CPHF's Fock builds (`ints["T"]`/`ints["V"]`/
+`build_fock!` inside `cphf_Amatvec`/`build_response_fock!`) -- its
+`eri_type` (whatever `wfn` was actually converged with, `SparseERI` by
+default) is honored rather than a hardcoded dense `Chonky` build, which
+also avoids the O(nbas^4)-per-CG-iteration dense contraction that hardcoding
+Chonky used to force.
 """
-function RHFhess(wfn::RHF)
+function RHFhess(ints::Fermi.Integrals.IntegralHelper, wfn::RHF)
     molecule = wfn.molecule
     atoms = molecule.atoms
     natm = length(atoms)
-    bset = BasisSet(wfn.orbitals.basis, atoms)
+    bset = BasisSet(ints.basis, ints.molecule.atoms)
     nbas = bset.nbas
-
-    ints = Fermi.Integrals.IntegralHelper(molecule=molecule, eri_type=Fermi.Integrals.Chonky())
 
     ndocc = wfn.ndocc
     C = wfn.orbitals.C
