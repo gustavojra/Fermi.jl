@@ -66,8 +66,20 @@ function build_df_hess_cache(wfn::RHF, ints::Fermi.Integrals.IntegralHelper{Floa
     @tensor W[m, i, A] := Co[n, i] * Pmn[m, n, A]
     @tensor V[m, i, A] := W[m, i, B] * Jinv[B, A]
 
+    # Qtot_PQ := sum_i (D*V_i)'*V_i, a small (naux,naux) matrix. Atom-
+    # independent (built entirely from the converged, zeroth-order D/V), so
+    # it's computed once here and reused as-is by Phase 4's direct term --
+    # differentiating Tr(Qtot.dJ/dA) w.r.t. a second atom only ever hits
+    # dJ/dA, never Qtot itself.
+    naux = auxbset.nbas
+    Qtot = zeros(naux, naux)
+    for i in 1:ndocc
+        Vi = @view V[:, i, :]
+        Qtot .+= (D * Vi)' * Vi
+    end
+
     return (bset=bset, auxbset=auxbset, Co=Co, D=D, Pmn=Pmn, Jmat=Jmat, Jinv=Jinv,
-            c=c, d=d, W=W, V=V)
+            c=c, d=d, W=W, V=V, Qtot=Qtot)
 end
 
 """
@@ -95,6 +107,8 @@ function df_hess_atom_derivs(cache, iA::Int)
     Kq = zeros(nbas, nbas, 3)
     dW_all = zeros(nbas, size(Co, 2), naux, 3)
     dV_expl_all = zeros(nbas, size(Co, 2), naux, 3)
+    dc_all = zeros(naux, 3)
+    dd_all = zeros(naux, 3)
 
     for q in 1:3
         ∇Pq = @view ∇Pmn[:, :, :, q]
@@ -103,6 +117,8 @@ function df_hess_atom_derivs(cache, iA::Int)
         @tensor dc[A] := D[m, n] * ∇Pq[m, n, A]
         dd = Jinv * dc
         f = Jinv * (∇Jq * d)
+        dc_all[:, q] .= dc
+        dd_all[:, q] .= dd
 
         @tensor Jq_q[m, n] := ∇Pq[m, n, A] * d[A] + Pmn[m, n, A] * (dd[A] - f[A])
         Jq[:, :, q] .= Jq_q
@@ -117,7 +133,8 @@ function df_hess_atom_derivs(cache, iA::Int)
         Kq[:, :, q] .= Kq_q .- Kcorr
     end
 
-    return (Jq=Jq, Kq=Kq, ∇Pmn=∇Pmn, ∇Jmat=∇Jmat, dW=dW_all, dV_expl=dV_expl_all)
+    return (Jq=Jq, Kq=Kq, ∇Pmn=∇Pmn, ∇Jmat=∇Jmat, dW=dW_all, dV_expl=dV_expl_all,
+            dc=dc_all, dd=dd_all)
 end
 
 eri_grad_JK_df(cache, iA::Int) = (r = df_hess_atom_derivs(cache, iA); (r.Jq, r.Kq))
@@ -194,4 +211,129 @@ function cphf_solve_df(wfn::RHF, ints, iA::Int, cache)
         U[:, :, q] .= sol
     end
     return U
+end
+
+# --- Phase 4: DF "direct" (P frozen) second-derivative term ---
+#
+# DF analog of ERI_hess_JK (TwoElectronHess.jl): d2X^A_DF/dAdB with P held
+# fixed at its converged value. Coulomb uses P-based c,d (matching
+# DFgrad.jl's ORIGINAL gradient convention -- 0.5*c^P.d^P is *directly*
+# X^A's 0.5*P.P.(mn|rs) contribution); since P=2D, c^P=2c^D, d^P=2d^D
+# exactly, reusing df_hess_atom_derivs's D-based dc via a factor of 2.
+#
+# An earlier version of this derivation tried to hand-simplify the second
+# derivative into a minimal closed form (mirroring how the *first*
+# derivative collapses via m<->n relabeling into the compact Jq_DF/Kq_DF
+# expressions) and got it wrong twice: it treated Phase 3's cached "dd"
+# (Jinv*dc only, deliberately missing the metric-derivative piece so
+# Jq_DF's own formula could add it back separately) as if it were the FULL
+# derivative of d, and treated Qtot (built from the converged, zeroth-order
+# V) as if it had no further B-dependence -- but V=W*Jinv itself depends on
+# geometry, so Qtot=sum_i V_i'DV_i does too, and differentiating
+# Tr(Qtot.dJ/dA) w.r.t. B needs a dQtot/dB term that formula silently
+# dropped. Caught by this phase's own finite-difference checkpoint (a ~4
+# Hartree/bohr^2 discrepancy on water/sto-3g, obviously wrong -- not a
+# subtle bug). Fixed by computing every second derivative object directly
+# via the product/chain rule instead of hand-simplifying, treating d and V
+# each as ordinary functions of geometry with their own (already-validated
+# at first order) derivative rules:
+#
+#   dJinv(A) = -Jinv.∇J_A.Jinv
+#   d2Jinv(A,B) = Jinv.∇J_A.Jinv.∇J_B.Jinv + Jinv.∇J_B.Jinv.∇J_A.Jinv - Jinv.∇2J_AB.Jinv
+#
+#   dd(A)_full = Jinv.dc(A) + dJinv(A).c            (Phase 3's cached "dd" is only the first piece)
+#   d2d(A,B) = Jinv.d2c(A,B) + dJinv(A).dc(B) + dJinv(B).dc(A) + d2Jinv(A,B).c
+#   E_J = 0.5*c.d  =>  d2E_J/dAdB = 0.5*[d2c(A,B).d + dc(A).dd(B)_full + dc(B).dd(A)_full + c.d2d(A,B)]
+#
+#   dV(A) = dW(A).Jinv + W.dJinv(A) = dV_expl(A) - g(A), g(A) := V.∇J_A.Jinv  (Phase 3)
+#   d2V(A,B) = d2W(A,B).Jinv + dW(A).dJinv(B) + dW(B).dJinv(A) + W.d2Jinv(A,B)
+#   E_K = -sum_i D.W.V  =>  d2E_K/dAdB = -sum_i D.[d2W(A,B).V + dW(A).dV(B) + dW(B).dV(A) + W.d2V(A,B)]
+#
+# (both E_J's and E_K's *first*-derivative forms were re-derived this same
+# way as a self-check and confirmed to reduce to the already-validated
+# gradient formulas before trusting the second-derivative extension).
+#
+# d2W[m,i,P](A,B) := sum_n C[n,i]*d2(mn|P)/dAdB -- not a new kernel, just
+# the new ∇2ERI_2e3c Hessian integral half-transformed by the converged
+# (fixed) C, computed fresh per atom pair (not cached -- an
+# O(natm^2)-sized cache of an (nbas,ndocc,naux) object per pair would be
+# wasteful, mirroring how ERI_hess_JK itself works fresh per pair).
+#
+# X^A_DF's second derivative is d2E_J/dAdB + d2E_K/dAdB directly (same
+# +dE_K/dA relationship established for the gradient/Phase 3, no extra
+# sign or prefactor -- K's own -4/-0.25 factors already cancel exactly).
+
+"""
+    ERI_hess_JK_df(cache, P::AbstractMatrix, iA::Int, iB::Int)
+
+DF analog of `ERI_hess_JK` (`TwoElectronHess.jl`) -- the two-electron
+Coulomb+exchange "direct" (density held fixed) contribution to the DF-RHF
+Hessian block `(iA,iB)`. See this file's header comment above for the full
+derivation. `P` is the converged density (`2*Co*Co'`); `cache` is
+`build_df_hess_cache`'s output.
+"""
+function ERI_hess_JK_df(cache, P::AbstractMatrix, iA::Int, iB::Int)
+    bset, auxbset = cache.bset, cache.auxbset
+    D, Co, Jinv, W, V = cache.D, cache.Co, cache.Jinv, cache.W, cache.V
+    cP = 2.0 .* cache.c
+    dP = 2.0 .* cache.d
+
+    rA = df_hess_atom_derivs(cache, iA)
+    rB = df_hess_atom_derivs(cache, iB)
+
+    ∇2Pmn = zeros(bset.nbas, bset.nbas, auxbset.nbas, 3, 3)
+    GaussianBasis.∇2ERI_2e3c!(∇2Pmn, bset, auxbset, iA, iB)
+    ∇2Jmat = zeros(auxbset.nbas, auxbset.nbas, 3, 3)
+    GaussianBasis.∇2ERI_2e2c!(∇2Jmat, auxbset, iA, iB)
+
+    H = zeros(3, 3)
+    for qA in 1:3, qB in 1:3
+        ∇Jq_A = @view rA.∇Jmat[:, :, qA]
+        ∇Jq_B = @view rB.∇Jmat[:, :, qB]
+        ∇2Pq = @view ∇2Pmn[:, :, :, qA, qB]
+        ∇2Jq = @view ∇2Jmat[:, :, qA, qB]
+
+        dJinv_A = -Jinv * ∇Jq_A * Jinv
+        dJinv_B = -Jinv * ∇Jq_B * Jinv
+        d2Jinv_AB = Jinv * ∇Jq_A * Jinv * ∇Jq_B * Jinv .+ Jinv * ∇Jq_B * Jinv * ∇Jq_A * Jinv .-
+                    Jinv * ∇2Jq * Jinv
+
+        ### Coulomb
+        dcP_A = 2.0 .* (@view rA.dc[:, qA])
+        dcP_B = 2.0 .* (@view rB.dc[:, qB])
+        ddP_A = Jinv * dcP_A .+ dJinv_A * cP
+        ddP_B = Jinv * dcP_B .+ dJinv_B * cP
+
+        @tensor d2cP[A] := P[m, n] * ∇2Pq[m, n, A]
+        d2dP = Jinv * d2cP .+ dJinv_A * dcP_B .+ dJinv_B * dcP_A .+ d2Jinv_AB * cP
+
+        Jpart = 0.5 * (dot(d2cP, dP) + dot(dcP_A, ddP_B) + dot(dcP_B, ddP_A) + dot(cP, d2dP))
+
+        ### Exchange
+        dW_A = @view rA.dW[:, :, :, qA]
+        dW_B = @view rB.dW[:, :, :, qB]
+
+        @tensor g_A[m, i, P] := V[m, i, R] * ∇Jq_A[R, S] * Jinv[S, P]
+        @tensor g_B[m, i, P] := V[m, i, R] * ∇Jq_B[R, S] * Jinv[S, P]
+        dV_A = (@view rA.dV_expl[:, :, :, qA]) .- g_A
+        dV_B = (@view rB.dV_expl[:, :, :, qB]) .- g_B
+
+        @tensor d2W[m, i, P] := Co[n, i] * ∇2Pq[m, n, P]
+        @tensor d2V_1[m, i, P] := d2W[m, i, Q] * Jinv[Q, P]
+        @tensor d2V_2[m, i, P] := dW_A[m, i, Q] * dJinv_B[Q, P]
+        @tensor d2V_3[m, i, P] := dW_B[m, i, Q] * dJinv_A[Q, P]
+        @tensor d2V_4[m, i, P] := W[m, i, Q] * d2Jinv_AB[Q, P]
+        d2V = d2V_1 .+ d2V_2 .+ d2V_3 .+ d2V_4
+
+        @tensor term1 = D[m, n] * d2W[m, i, P] * V[n, i, P]
+        @tensor term2 = D[m, n] * dW_A[m, i, P] * dV_B[n, i, P]
+        @tensor term3 = D[m, n] * dW_B[m, i, P] * dV_A[n, i, P]
+        @tensor term4 = D[m, n] * W[m, i, P] * d2V[n, i, P]
+
+        Kpart = -(term1 + term2 + term3 + term4)
+
+        H[qA, qB] = Jpart + Kpart
+    end
+
+    return H
 end

@@ -301,6 +301,90 @@ using TensorOperations
         @set printstyle none
     end
 
+    @testset "DF direct two-electron Hessian (ERI_hess_JK_df)" begin
+        # Phase 4 of the DF-RHF analytic Hessian plan: the DF analog of
+        # ERI_hess_JK, i.e. d2X^A_DF/dAdB with P/C held fixed. See DFHess.jl's
+        # header comment for the derivation (a from-scratch product-rule
+        # rederivation of d2c/dAdB, d2d/dAdB, d2W/dAdB, d2V/dAdB -- an
+        # earlier hand-simplified attempt using shortcuts analogous to how
+        # the *first* derivative collapses was wrong in two independent
+        # ways, caught by this exact checkpoint).
+        Fermi.Options.set("molstring", """
+        O   0.000000000000   0.000000000000  -0.143225816552
+        H   0.000000000000   1.638036840407   1.136548822547
+        H   0.000000000000  -1.638036840407   1.136548822547
+        """)
+        Fermi.Options.set("unit", "bohr")
+        basis = "sto-3g"
+        Fermi.Options.set("basis", basis)
+        Fermi.Options.set("df", true)
+
+        aoints = Fermi.Integrals.IntegralHelper(eri_type=Fermi.Integrals.RIFIT())
+        wf = Fermi.HartreeFock.RHF(aoints, Fermi.HartreeFock.get_rhf_alg())
+        cache = Fermi.HartreeFock.build_df_hess_cache(wf, aoints)
+        atoms = wf.molecule.atoms
+        natm = length(atoms)
+
+        ndocc = wf.ndocc
+        Co = wf.orbitals.C[:, 1:ndocc]
+        P = 2.0 .* (Co * Co')
+
+        @testset "Block symmetry (free, FD-independent)" begin
+            for iA in 1:natm, iB in 1:natm
+                HAB = Fermi.HartreeFock.ERI_hess_JK_df(cache, P, iA, iB)
+                HBA = Fermi.HartreeFock.ERI_hess_JK_df(cache, P, iB, iA)
+                @test HAB ≈ HBA' atol=1e-8
+            end
+        end
+
+        @testset "vs double finite difference of the dense DF direct energy" begin
+            function X_DF(newatoms)
+                bs = BasisSet(basis, newatoms)
+                aux = BasisSet(aoints.eri_type.basisset.name, newatoms)
+                Pmn_ = ERI_2e3c(bs, aux)
+                Jinv_ = inv(ERI_2e2c(aux))
+                @tensor ERI[m, n, r, s] := Pmn_[m, n, A] * Jinv_[A, B] * Pmn_[r, s, B]
+                @tensor Xj = 0.5 * P[m, n] * P[r, s] * ERI[m, n, r, s]
+                @tensor Xk = 0.25 * P[m, n] * P[r, s] * ERI[m, s, r, n]
+                return Xj - Xk
+            end
+
+            function displaced(atoms, iA, kA, dA, iB, kB, dB)
+                newatoms = deepcopy(atoms)
+                xyzA = collect(newatoms[iA].xyz); xyzA[kA] += dA
+                newatoms[iA] = Molecules.Atom(newatoms[iA].Z, newatoms[iA].mass, xyzA)
+                xyzB = collect(newatoms[iB].xyz); xyzB[kB] += dB
+                newatoms[iB] = Molecules.Atom(newatoms[iB].Z, newatoms[iB].mass, xyzB)
+                return newatoms
+            end
+
+            h = 5e-3
+            B2A = Molecules.bohr_to_angstrom
+
+            for iA in 1:natm, iB in 1:natm
+                Hd = Fermi.HartreeFock.ERI_hess_JK_df(cache, P, iA, iB)
+                for qA in 1:3, qB in 1:3
+                    if iA == iB && qA == qB
+                        fp = X_DF(displaced(atoms, iA, qA, h, iB, qB, 0.0))
+                        f0 = X_DF(atoms)
+                        fm = X_DF(displaced(atoms, iA, qA, -h, iB, qB, 0.0))
+                        d2 = (fp - 2 * f0 + fm) / (h / B2A)^2
+                    else
+                        fpp = X_DF(displaced(atoms, iA, qA, h, iB, qB, h))
+                        fpm = X_DF(displaced(atoms, iA, qA, h, iB, qB, -h))
+                        fmp = X_DF(displaced(atoms, iA, qA, -h, iB, qB, h))
+                        fmm = X_DF(displaced(atoms, iA, qA, -h, iB, qB, -h))
+                        d2 = (fpp - fpm - fmp + fmm) / (4 * (h / B2A)^2)
+                    end
+                    @test Hd[qA, qB] ≈ d2 atol=1e-3
+                end
+            end
+        end
+
+        @reset
+        @set printstyle none
+    end
+
     @testset "Full RHF Hessian (finite difference of the gradient, and Psi4)" begin
         Fermi.Options.set("molstring", """
         O   0.000000000000   0.000000000000   0.000000000000
