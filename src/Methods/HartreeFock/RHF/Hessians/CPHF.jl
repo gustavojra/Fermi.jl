@@ -89,14 +89,52 @@ end
 #      reuse trick, no new two-electron code.
 
 """
+    eri_grad_JK(bset::BasisSet, D::AbstractMatrix, iA::Int)
+
+Coulomb- and exchange-shaped contractions of the *first*-derivative ERI
+against a density-like matrix `D`, for all three Cartesian directions of
+atom `iA`: `Jq[m,n] = sum_rs D[r,s]*d(mn|rs)/dA_q`, `Kq[m,n] = sum_rs
+D[r,s]*d(mr|ns)/dA_q`. Returned as two `(nbas,nbas,3)` arrays.
+
+Built directly from `GaussianBasis.∇sparseERI_2e4c`'s compressed
+(permutation-unique) derivative list -- never materializes the dense
+`(nbas,nbas,nbas,nbas,3)` derivative ERI tensor `∇ERI_2e4c!` would. For
+each stored unique quartet, accumulates into `Jq`/`Kq` over the
+(deduplicated) 8-member index-permutation orbit that shares its value;
+validated against the dense `∇ERI_2e4c!`-based reference to machine
+precision (both sto-3g and cc-pVDZ, several atoms) before use here.
+"""
+function eri_grad_JK(bset::BasisSet, D::AbstractMatrix, iA::Int)
+    nbas = bset.nbas
+    Jq = zeros(nbas, nbas, 3)
+    Kq = zeros(nbas, nbas, 3)
+    idx, xyz... = GaussianBasis.∇sparseERI_2e4c(bset, iA)
+    for i in eachindex(idx)
+        μ, ν, λ, σ = Int.(idx[i])
+        orbit = unique([(μ, ν, λ, σ), (ν, μ, λ, σ), (μ, ν, σ, λ), (ν, μ, σ, λ),
+                        (λ, σ, μ, ν), (σ, λ, μ, ν), (λ, σ, ν, μ), (σ, λ, ν, μ)])
+        for q in 1:3
+            ∇k = xyz[q][i]
+            abs(∇k) < 1e-12 && continue
+            for (a, b, c, d) in orbit
+                Jq[a, b, q] += D[c, d] * ∇k
+                Kq[a, c, q] += D[b, d] * ∇k
+            end
+        end
+    end
+    return Jq, Kq
+end
+
+"""
     cphf_rhs(wfn, ints, iA)
 
 CPHF right-hand side `B_ai^(y)` for all three Cartesian directions of atom
 `iA`, returned as a `(nvir,ndocc,3)` array. Built entirely from existing
-first-derivative integrals (`∇kinetic!`/`∇nuclear!`/`∇overlap!`/`∇ERI_2e4c!`)
-contracted against the converged density -- no second-derivative integrals
-involved (those are the direct/"integral response" Hessian piece,
-`ERI_hess_JK`/the one-electron Hessian code, assembled separately).
+first-derivative integrals (`∇kinetic!`/`∇nuclear!`/`∇overlap!`/
+`eri_grad_JK`) contracted against the converged density -- no
+second-derivative integrals involved (those are the direct/"integral
+response" Hessian piece, `ERI_hess_JK`/the one-electron Hessian code,
+assembled separately).
 """
 function cphf_rhs(wfn::RHF, ints, iA)
     bset = BasisSet(wfn.orbitals.basis, wfn.molecule.atoms)
@@ -118,17 +156,13 @@ function cphf_rhs(wfn::RHF, ints, iA)
     ∂S = zeros(nbas, nbas, 3)
     GaussianBasis.∇overlap!(∂S, bset, iA)
 
-    ∂ERI = zeros(nbas, nbas, nbas, nbas, 3)
-    GaussianBasis.∇ERI_2e4c!(∂ERI, bset, iA)
+    Jq_all, Kq_all = eri_grad_JK(bset, D, iA)
 
     B = zeros(nvir, ndocc, 3)
     G = zeros(nbas, nbas)
     H0 = zeros(nbas, nbas)
     for q in 1:3
-        ∂ERIq = @view ∂ERI[:, :, :, :, q]
-        @tensoropt Jq[m, n] := D[r, s] * ∂ERIq[m, n, r, s]
-        @tensoropt Kq[m, n] := D[r, s] * ∂ERIq[m, r, n, s]
-        Fskel = @view(∂H[:, :, q]) .+ 2 .* Jq .- Kq
+        Fskel = @view(∂H[:, :, q]) .+ 2 .* (@view Jq_all[:, :, q]) .- (@view Kq_all[:, :, q])
 
         Sq = @view ∂S[:, :, q]
         S_oo = Co' * Sq * Co

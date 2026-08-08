@@ -23,18 +23,25 @@ using GaussianBasis
 #     rotation gauge that the density response P doesn't need but Q does --
 #     avoided entirely by working with D and F directly. The P-response
 #     2-electron term reuses RHFgrad.jl's own AUX_ERI contraction pattern,
-#     just with one of the two P factors replaced by dP/dB.
+#     just with one of the two P factors replaced by dP/dB -- and, since
+#     that contraction is linear in the fixed density factor and P=2D,
+#     it's exactly `2*sum(dP_B.*Jq) - sum(dP_B.*Kq)` using the SAME
+#     Jq,Kq=eri_grad_JK(bset,D,iA) already computed for Fskel below (no
+#     separate computation, no dense (nbas,nbas,nbas,nbas) array ever
+#     materialized -- verified against the dense/AUX_ERI formula to
+#     machine precision before use here).
 #
 # Validated end-to-end (this whole assembly, not pieces in isolation)
 # against finite difference of Fermi's own analytic gradient: matches to
 # ~8e-7 (finite-difference precision) on water/sto-3g.
 
 struct RHFHessResponse
-    dD::Array{Float64,3}    # (nbas,nbas,3) -- half-density response, D=Co*Co'
-    dF::Array{Float64,3}    # (nbas,nbas,3) -- AO Fock response (skeleton + P-response)
-    ∂H::Array{Float64,3}    # (nbas,nbas,3) -- first-derivative core Hamiltonian
-    ∂S::Array{Float64,3}    # (nbas,nbas,3) -- first-derivative overlap
-    ∂ERI::Array{Float64,5}  # (nbas,nbas,nbas,nbas,3) -- first-derivative ERI
+    dD::Array{Float64,3}  # (nbas,nbas,3) -- half-density response, D=Co*Co'
+    dF::Array{Float64,3}  # (nbas,nbas,3) -- AO Fock response (skeleton + P-response)
+    ∂H::Array{Float64,3}  # (nbas,nbas,3) -- first-derivative core Hamiltonian
+    ∂S::Array{Float64,3}  # (nbas,nbas,3) -- first-derivative overlap
+    Jq::Array{Float64,3}  # (nbas,nbas,3) -- sum_rs D[r,s]*d(mn|rs)/dA_q
+    Kq::Array{Float64,3}  # (nbas,nbas,3) -- sum_rs D[r,s]*d(mr|ns)/dA_q
 end
 
 function _rhf_hess_response(wfn::RHF, ints, bset, iA, Co, Cv, D)
@@ -50,17 +57,13 @@ function _rhf_hess_response(wfn::RHF, ints, bset, iA, Co, Cv, D)
     ∂S = zeros(nbas, nbas, 3)
     GaussianBasis.∇overlap!(∂S, bset, iA)
 
-    ∂ERI = zeros(nbas, nbas, nbas, nbas, 3)
-    GaussianBasis.∇ERI_2e4c!(∂ERI, bset, iA)
+    Jq_all, Kq_all = eri_grad_JK(bset, D, iA)
 
     dD = zeros(nbas, nbas, 3)
     dF = zeros(nbas, nbas, 3)
     H0 = zeros(nbas, nbas)
     for q in 1:3
-        ∂ERIq = @view ∂ERI[:, :, :, :, q]
-        @tensoropt Jq[m, n] := D[r, s] * ∂ERIq[m, n, r, s]
-        @tensoropt Kq[m, n] := D[r, s] * ∂ERIq[m, r, n, s]
-        Fskel = @view(∂H[:, :, q]) .+ 2 .* Jq .- Kq
+        Fskel = @view(∂H[:, :, q]) .+ 2 .* (@view Jq_all[:, :, q]) .- (@view Kq_all[:, :, q])
 
         Sq = @view ∂S[:, :, q]
         S_oo = Co' * Sq * Co
@@ -78,21 +81,7 @@ function _rhf_hess_response(wfn::RHF, ints, bset, iA, Co, Cv, D)
         dF[:, :, q] .= Fskel .+ ΔF .+ G
     end
 
-    return RHFHessResponse(dD, dF, ∂H, ∂S, ∂ERI)
-end
-
-# d/dB of X^A (the two-electron gradient term) holding ∂ERI^A fixed, i.e. the
-# "one P replaced by dP/dB" piece -- same AUX_ERI construction as RHFgrad.jl,
-# generalized to two different density-like factors.
-function _eri_response_term(∂ERIq, dP, P)
-    nbas = size(P, 1)
-    AUX = zeros(nbas, nbas, nbas, nbas)
-    permutedims!(AUX, ∂ERIq, (1, 4, 3, 2))
-    AUX .*= -0.5
-    AUX .+= ∂ERIq
-    @tensoropt X1 = 0.5 * dP[μ, ν] * P[λ, σ] * AUX[μ, ν, σ, λ]
-    @tensoropt X2 = 0.5 * P[μ, ν] * dP[λ, σ] * AUX[μ, ν, σ, λ]
-    return X1 + X2
+    return RHFHessResponse(dD, dF, ∂H, ∂S, Jq_all, Kq_all)
 end
 
 """
@@ -143,7 +132,7 @@ function RHFhess(wfn::RHF)
             dQ_B = 2.0 .* ((@view RB.dD[:, :, qB]) * F * D .+ D * (@view RB.dF[:, :, qB]) * D .+ D * F * (@view RB.dD[:, :, qB]))
 
             term = sum(dP_B .* (@view RA.∂H[:, :, qA])) - sum(dQ_B .* (@view RA.∂S[:, :, qA]))
-            term += _eri_response_term((@view RA.∂ERI[:, :, :, :, qA]), dP_B, P)
+            term += 2 * sum(dP_B .* (@view RA.Jq[:, :, qA])) - sum(dP_B .* (@view RA.Kq[:, :, qA]))
 
             term += sum(P .* (@view (H1e_T .+ H1e_V)[:, :, qA, qB]))
             term -= sum(Q .* (@view H1e_S[:, :, qA, qB]))
