@@ -89,7 +89,7 @@ end
 #      reuse trick, no new two-electron code.
 
 """
-    eri_grad_JK(bset::BasisSet, D::AbstractMatrix, iA::Int)
+    eri_grad_JK(bset::BasisSet, D::AbstractMatrix, iA::Int; ij_vals=nothing, σvals=nothing)
 
 Coulomb- and exchange-shaped contractions of the *first*-derivative ERI
 against a density-like matrix `D`, for all three Cartesian directions of
@@ -103,12 +103,18 @@ each stored unique quartet, accumulates into `Jq`/`Kq` over the
 (deduplicated) 8-member index-permutation orbit that shares its value;
 validated against the dense `∇ERI_2e4c!`-based reference to machine
 precision (both sto-3g and cc-pVDZ, several atoms) before use here.
+
+`ij_vals`/`σvals` are `∇sparseERI_2e4c`'s Schwarz screening bound
+(`GaussianBasis.schwarz_bounds(bset)`), atom-independent -- callers looping
+over every atom (this function is called once per atom, twice per atom
+counting `cphf_rhs`'s own call inside `cphf_solve`) should compute it once
+and pass it through rather than recomputing it on every call.
 """
-function eri_grad_JK(bset::BasisSet, D::AbstractMatrix, iA::Int)
+function eri_grad_JK(bset::BasisSet, D::AbstractMatrix, iA::Int; ij_vals = nothing, σvals = nothing)
     nbas = bset.nbas
     Jq = zeros(nbas, nbas, 3)
     Kq = zeros(nbas, nbas, 3)
-    idx, xyz... = GaussianBasis.∇sparseERI_2e4c(bset, iA)
+    idx, xyz... = GaussianBasis.∇sparseERI_2e4c(bset, iA; ij_vals=ij_vals, σvals=σvals)
     for i in eachindex(idx)
         μ, ν, λ, σ = Int.(idx[i])
         orbit = unique([(μ, ν, λ, σ), (ν, μ, λ, σ), (μ, ν, σ, λ), (ν, μ, σ, λ),
@@ -136,7 +142,7 @@ second-derivative integrals involved (those are the direct/"integral
 response" Hessian piece, `ERI_hess_JK`/the one-electron Hessian code,
 assembled separately).
 """
-function cphf_rhs(wfn::RHF, ints, iA)
+function cphf_rhs(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing)
     bset = BasisSet(wfn.orbitals.basis, wfn.molecule.atoms)
     nbas = bset.nbas
     ndocc = wfn.ndocc
@@ -156,7 +162,7 @@ function cphf_rhs(wfn::RHF, ints, iA)
     ∂S = zeros(nbas, nbas, 3)
     GaussianBasis.∇overlap!(∂S, bset, iA)
 
-    Jq_all, Kq_all = eri_grad_JK(bset, D, iA)
+    Jq_all, Kq_all = eri_grad_JK(bset, D, iA; ij_vals=ij_vals, σvals=σvals)
 
     B = zeros(nvir, ndocc, 3)
     G = zeros(nbas, nbas)
@@ -185,7 +191,7 @@ returned as a `(nvir,ndocc,3)` array. Solves
 CG (the orbital Hessian is symmetric positive definite at a true RHF
 minimum), one right-hand side at a time.
 """
-function cphf_solve(wfn::RHF, ints, iA)
+function cphf_solve(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing)
     ndocc = wfn.ndocc
     nbas = size(wfn.orbitals.C, 1)
     nvir = nbas - ndocc
@@ -198,7 +204,7 @@ function cphf_solve(wfn::RHF, ints, iA)
     maxiter = Options.get("cphf_max_iter")
     tol = Options.get("cphf_conv")
 
-    B = cphf_rhs(wfn, ints, iA)
+    B = cphf_rhs(wfn, ints, iA; ij_vals=ij_vals, σvals=σvals)
     U = zeros(nvir, ndocc, 3)
     for q in 1:3
         matvec(x) = Δeps .* x .+ cphf_Amatvec(x, Co, Cv, ints)

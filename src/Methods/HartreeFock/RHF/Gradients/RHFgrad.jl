@@ -126,6 +126,11 @@ function RHFgrad(wfn::RHF)
     # Intermediate auxiliary arrays
     AUX = zeros(nbas, nbas)
 
+    # Schwarz screening bound is atom-independent -- compute it once here
+    # rather than paying its O(nshells^2) cost again inside ∇sparseERI_2e4c
+    # for every atom in the loop below.
+    ij_vals, σvals = GaussianBasis.schwarz_bounds(bset)
+
     for a in eachindex(atoms)
 
         ∂H .= 0
@@ -144,7 +149,7 @@ function RHFgrad(wfn::RHF)
         # Now use S for overlap
         GaussianBasis.∇overlap!(∂S, bset, a)
 
-        idx, xyz... = GaussianBasis.∇sparseERI_2e4c(bset, a)
+        idx, xyz... = GaussianBasis.∇sparseERI_2e4c(bset, a; ij_vals=ij_vals, σvals=σvals)
 
         for q in 1:3
             @views vH = ∂H[:,:,q]
@@ -218,6 +223,11 @@ function RHFgrad(aoints::Fermi.Integrals.IntegralHelper, wfn::RHF)
     # Intermediate auxiliary arrays
     AUX = zeros(nbas, nbas)
 
+    # Schwarz screening bound is atom-independent -- compute it once here
+    # rather than paying its O(nshells^2) cost again inside ∇sparseERI_2e4c
+    # for every atom in the loop below.
+    ij_vals, σvals = GaussianBasis.schwarz_bounds(bset)
+
     for a in eachindex(atoms)
 
         ∂H .= 0
@@ -236,7 +246,7 @@ function RHFgrad(aoints::Fermi.Integrals.IntegralHelper, wfn::RHF)
         # Now use S for overlap
         GaussianBasis.∇overlap!(∂S, bset, a)
 
-        idx, xyz... = GaussianBasis.∇sparseERI_2e4c(bset, a)
+        idx, xyz... = GaussianBasis.∇sparseERI_2e4c(bset, a; ij_vals=ij_vals, σvals=σvals)
 
         for q in 1:3
             @views vH = ∂H[:,:,q]
