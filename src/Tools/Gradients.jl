@@ -52,6 +52,13 @@ aoints = Fermi.Integrals.IntegralHelper()
 wfn = @energy aoints => rhf
 grad = @gradient aoints, wfn => rhf
 ```
+RHF's analytic gradient follows whatever `eri_type` `aoints` carries --
+`Chonky`/`SparseERI` use the exact ERI, while a density-fitted `aoints`
+(`@set df true`, or an explicit `JKFIT()`/`RIFIT()` `eri_type`) gets the
+matching RI-HF analytic gradient (no CPHF needed, same as the exact-ERI
+case). This dispatch is only reachable through the two-argument
+`aoints, wfn => rhf` form -- `@gradient wfn => rhf` and bare `@gradient rhf`
+always use `Chonky`/`SparseERI`, regardless of `df`.
 
 # Implemented methods:
     Method   Type      Description
