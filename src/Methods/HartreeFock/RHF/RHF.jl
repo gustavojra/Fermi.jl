@@ -126,6 +126,7 @@ include("Gradients/DFgrad.jl")
 include("Hessians/TwoElectronHess.jl")
 include("Hessians/CPHF.jl")
 include("Hessians/RHFhess.jl")
+include("Hessians/DFHess.jl")
 
 ### MISCELLANEOUS
 # Pretty printing

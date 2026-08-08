@@ -170,6 +170,137 @@ using TensorOperations
         Fermi.Options.set("basis", basis)
     end
 
+    @testset "DF Jq/Kq and CPHF orbital response" begin
+        # Phase 3 of the DF-RHF analytic Hessian plan: Jq_DF/Kq_DF (the
+        # matrix-valued, density-fitted analog of eri_grad_JK) and the CPHF
+        # machinery built on top of them (cphf_rhs_df/cphf_solve_df).
+        Fermi.Options.set("molstring", """
+        O   0.000000000000   0.000000000000  -0.143225816552
+        H   0.000000000000   1.638036840407   1.136548822547
+        H   0.000000000000  -1.638036840407   1.136548822547
+        """)
+        Fermi.Options.set("unit", "bohr")
+        basis = "sto-3g"
+        Fermi.Options.set("basis", basis)
+        Fermi.Options.set("df", true)
+
+        aoints = Fermi.Integrals.IntegralHelper(eri_type=Fermi.Integrals.RIFIT())
+        wf = Fermi.HartreeFock.RHF(aoints, Fermi.HartreeFock.get_rhf_alg())
+        cache = Fermi.HartreeFock.build_df_hess_cache(wf, aoints)
+        atoms = wf.molecule.atoms
+        natm = length(atoms)
+
+        @testset "Kq_DF symmetry (free, FD-independent)" begin
+            for iA in 1:natm
+                _, Kq = Fermi.HartreeFock.eri_grad_JK_df(cache, iA)
+                for q in 1:3
+                    @test Kq[:, :, q] ≈ Kq[:, :, q]' atol=1e-8
+                end
+            end
+        end
+
+        @testset "Jq_DF/Kq_DF vs dense brute force" begin
+            # Build the dense (mn|rs)_DF tensor from Pmn/Jinv directly and
+            # finite-difference IT (a completely independent computation
+            # path from Jq_DF/Kq_DF's own analytic formula), mirroring how
+            # eri_grad_JK's own original validation worked one derivative
+            # order down.
+            bset, auxbset = cache.bset, cache.auxbset
+            D = cache.D
+            h = 1e-4
+            B2A = Molecules.bohr_to_angstrom
+
+            function displaced_bsets(iA, k, delta)
+                newatoms = deepcopy(atoms)
+                xyz = collect(newatoms[iA].xyz)
+                xyz[k] += delta
+                newatoms[iA] = Molecules.Atom(newatoms[iA].Z, newatoms[iA].mass, xyz)
+                return BasisSet(basis, newatoms), BasisSet(aoints.eri_type.basisset.name, newatoms)
+            end
+
+            for iA in 1:natm
+                Jq, Kq = Fermi.HartreeFock.eri_grad_JK_df(cache, iA)
+                for k in 1:3
+                    bsp, auxp = displaced_bsets(iA, k, h)
+                    bsm, auxm = displaced_bsets(iA, k, -h)
+                    Pmn_p = ERI_2e3c(bsp, auxp); Jinv_p = inv(ERI_2e2c(auxp))
+                    Pmn_m = ERI_2e3c(bsm, auxm); Jinv_m = inv(ERI_2e2c(auxm))
+                    @tensor ERI_p[m, n, r, s] := Pmn_p[m, n, A] * Jinv_p[A, B] * Pmn_p[r, s, B]
+                    @tensor ERI_m[m, n, r, s] := Pmn_m[m, n, A] * Jinv_m[A, B] * Pmn_m[r, s, B]
+                    dERI = (ERI_p .- ERI_m) ./ (2h / B2A)
+
+                    @tensor Jq_ref[m, n] := D[r, s] * dERI[m, n, r, s]
+                    @tensor Kq_ref[m, n] := D[r, s] * dERI[m, r, n, s]
+
+                    @test Jq[:, :, k] ≈ Jq_ref atol=1e-5
+                    @test Kq[:, :, k] ≈ Kq_ref atol=1e-5
+                end
+            end
+        end
+
+        @testset "CPHF orbital response (finite difference of the SCF density)" begin
+            C = wf.orbitals.C
+            ndocc = wf.ndocc
+            Co = C[:, 1:ndocc]
+            Cv = C[:, ndocc+1:end]
+            bset = cache.bset
+
+            function displaced_molstring(iA, k, delta)
+                newatoms = deepcopy(atoms)
+                xyz = collect(newatoms[iA].xyz)
+                xyz[k] += delta
+                newatoms[iA] = Molecules.Atom(newatoms[iA].Z, newatoms[iA].mass, xyz)
+                return join(["$(Int(a.Z))   $(a.xyz[1])   $(a.xyz[2])   $(a.xyz[3])" for a in newatoms], "\n")
+            end
+
+            function scf_D(molstring)
+                Fermi.Options.set("molstring", molstring)
+                Fermi.Options.set("unit", "angstrom")
+                Fermi.Options.set("basis", basis)
+                Fermi.Options.set("df", true)
+                ints_ = Fermi.Integrals.IntegralHelper(eri_type=Fermi.Integrals.RIFIT())
+                wf_ = Fermi.HartreeFock.RHF(ints_, Fermi.HartreeFock.get_rhf_alg())
+                Co_ = wf_.orbitals.C[:, 1:wf_.ndocc]
+                return Co_ * Co_'
+            end
+
+            B2A = Molecules.bohr_to_angstrom
+            h = 5e-4
+
+            for iA in 1:natm
+                U = Fermi.HartreeFock.cphf_solve_df(wf, aoints, iA, cache)
+
+                ∂S = zeros(size(Co, 1), size(Co, 1), 3)
+                GaussianBasis.∇overlap!(∂S, bset, iA)
+
+                for q in 1:3
+                    Dp = scf_D(displaced_molstring(iA, q, h))
+                    Dm = scf_D(displaced_molstring(iA, q, -h))
+                    dD_FD = (Dp .- Dm) ./ (2h / B2A)
+
+                    ΔD = Cv * U[:, :, q] * Co'
+                    ΔD .+= ΔD'
+                    S_oo = Co' * (@view ∂S[:, :, q]) * Co
+                    dD_analytic = ΔD .- Co * S_oo * Co'
+
+                    @test dD_analytic ≈ dD_FD atol=1e-5
+                end
+            end
+
+            Fermi.Options.set("molstring", """
+            O   0.000000000000   0.000000000000  -0.143225816552
+            H   0.000000000000   1.638036840407   1.136548822547
+            H   0.000000000000  -1.638036840407   1.136548822547
+            """)
+            Fermi.Options.set("unit", "bohr")
+            Fermi.Options.set("basis", basis)
+            Fermi.Options.set("df", true)
+        end
+
+        @reset
+        @set printstyle none
+    end
+
     @testset "Full RHF Hessian (finite difference of the gradient, and Psi4)" begin
         Fermi.Options.set("molstring", """
         O   0.000000000000   0.000000000000   0.000000000000
