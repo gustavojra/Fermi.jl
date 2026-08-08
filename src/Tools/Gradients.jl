@@ -42,11 +42,21 @@ or
 @gradient rhf <= mol
 ```
 
-A bare `@gradient rhf` (or `mol => rhf`) has no atomic integrals (`aoints`) to
-reuse, so it builds one internally and prints a warning before doing so. To
-avoid recomputing atomic integrals when you already have a wave function and/or
-an `IntegralHelper` at the same geometry (e.g. right after `@energy`), pass
-them in directly:
+A bare `@gradient rhf` (or `mol => rhf`) has no wave function or atomic
+integrals (`aoints`) to reuse, so it runs SCF from scratch and prints a
+warning before doing so (real, unavoidable work -- SCF needs its atomic
+integrals regardless). To avoid that when you already have a wave function
+at the same geometry (e.g. right after `@energy`), pass it in directly --
+`@gradient wfn => rhf` builds its own throwaway `aoints` internally, but
+prints no warning: the gradient itself never touches `aoints`'s cache, only
+cheap basis/molecule metadata, so nothing expensive is actually being
+redone. That internal `aoints` still follows the current `@set df <bool>`
+option though (same as a fresh `IntegralHelper()` would), so the gradient
+matches whatever ERI representation `wfn` was actually converged with.
+
+For full control (e.g. mixing `df` settings between energy and gradient, or
+truly avoiding any extra `IntegralHelper` construction), pass `aoints`
+explicitly:
 ```
 aoints = Fermi.Integrals.IntegralHelper()
 wfn = @energy aoints => rhf
@@ -56,9 +66,7 @@ RHF's analytic gradient follows whatever `eri_type` `aoints` carries --
 `Chonky`/`SparseERI` use the exact ERI, while a density-fitted `aoints`
 (`@set df true`, or an explicit `JKFIT()`/`RIFIT()` `eri_type`) gets the
 matching RI-HF analytic gradient (no CPHF needed, same as the exact-ERI
-case). This dispatch is only reachable through the two-argument
-`aoints, wfn => rhf` form -- `@gradient wfn => rhf` and bare `@gradient rhf`
-always use `Chonky`/`SparseERI`, regardless of `df`.
+case).
 
 # Implemented methods:
     Method   Type      Description
