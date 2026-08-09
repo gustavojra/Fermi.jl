@@ -228,6 +228,7 @@ function RHFgrad(aoints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.In
 
     Nvals = GaussianBasis.num_basis.(bset.basis)
     ao_offset = [sum(Nvals[1:(i-1)]) for i = 1:nshells]
+    Nmax = maximum(Nvals)
 
     # Schwarz screening bound is atom-independent -- compute it once here
     # rather than paying its O(nshells^2) cost again for every atom below.
@@ -303,6 +304,16 @@ function RHFgrad(aoints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.In
         @sync for _ in 1:ntasks
             Threads.@spawn begin
                 local_E = zeros(3)
+                # Per-task scratch, reused across every quartet this worker
+                # ever sees -- avoids the ~1.3 KB/call (fresh `out`, fresh
+                # libcint `buf`, allocating `permutedims`) that profiling
+                # found here, which added up to several GB of GC churn over
+                # a full gradient. See GaussianBasis.jl's scratch-accepting
+                # `∇ERI_2e4c!` docstring for the corresponding fix on its side.
+                out_buf = zeros(Nmax, Nmax, Nmax, Nmax, 3)
+                cint_buf = zeros(Cdouble, 3*Nmax^4)
+                cint_tmp = zeros(Cdouble, 3*Nmax^4)
+                shls_buf = zeros(Cint, 4)
                 for chunk in requests
                     for (i, j, k, l) in chunk
                         Ni, Nj, Nk, Nl = Nvals[i], Nvals[j], Nvals[k], Nvals[l]
@@ -312,7 +323,8 @@ function RHFgrad(aoints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.In
                         L = (ao_offset[l]+1):(ao_offset[l]+Nl)
 
                         on_A = (on_atom[i], on_atom[j], on_atom[k], on_atom[l])
-                        blk = GaussianBasis.∇ERI_2e4c(bset, on_A, i, j, k, l)
+                        blk = @view out_buf[1:Ni, 1:Nj, 1:Nk, 1:Nl, :]
+                        GaussianBasis.∇ERI_2e4c!(blk, bset, on_A, i, j, k, l, cint_buf, cint_tmp, shls_buf)
 
                         for q in 1:3
                             bq = @view blk[:,:,:,:,q]
