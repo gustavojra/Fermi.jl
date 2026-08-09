@@ -126,14 +126,17 @@ function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals
     on_A = falses(nshells)
     on_B = falses(nshells)
     for s in 1:nshells
-        bset.basis[s].atom == Aat && (on_A[s] = true)
-        bset.basis[s].atom == Bat && (on_B[s] = true)
+        bset.basis[s].atom === Aat && (on_A[s] = true)
+        bset.basis[s].atom === Bat && (on_B[s] = true)
     end
 
     # Pre-screen the canonical quadruple work list -- Schwarz bound and
     # atom-membership are both O(1) checks (given precomputed on_A/on_B),
     # cheap to do up front so worker tasks only ever see quadruples that
-    # need real work.
+    # need real work. Also excludes the iA==iB, all-four-shells-on-that-atom
+    # translational-invariance case here (GaussianBasis.jl's ∇2ERI_2e4c no
+    # longer checks it itself when called with precomputed flags below --
+    # this loop already has everything needed to check it once, up front).
     quartets = NTuple{4,Int}[]
     @inbounds for i in 1:nshells, j in i:nshells
         ij_idx = GaussianBasis.index2(i-1,j-1)
@@ -145,6 +148,7 @@ function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals
 
             (on_A[i]||on_A[j]||on_A[k]||on_A[l]) || continue
             (on_B[i]||on_B[j]||on_B[k]||on_B[l]) || continue
+            (iA == iB && on_A[i] && on_A[j] && on_A[k] && on_A[l]) && continue
 
             push!(quartets, (i, j, k, l))
         end
@@ -178,7 +182,9 @@ function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals
                     K = (koff+1):(koff+Nk)
                     L = (loff+1):(loff+Nl)
 
-                    blk_full = GaussianBasis.∇2ERI_2e4c(bset, iA, iB, i, j, k, l)
+                    Xflag = (on_A[i], on_A[j], on_A[k], on_A[l])
+                    Yflag = (on_B[i], on_B[j], on_B[k], on_B[l])
+                    blk_full = GaussianBasis.∇2ERI_2e4c(bset, Xflag, Yflag, i, j, k, l)
 
                     ij_ne_kl = GaussianBasis.index2(i-1,j-1) != GaussianBasis.index2(k-1,l-1)
                     mult = (i != j ? 2 : 1) * (k != l ? 2 : 1) * (ij_ne_kl ? 2 : 1)

@@ -265,7 +265,7 @@ function RHFgrad(aoints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.In
         A = atoms[a]
         on_atom = falses(nshells)
         for s in 1:nshells
-            bset.basis[s].atom == A && (on_atom[s] = true)
+            bset.basis[s].atom === A && (on_atom[s] = true)
         end
 
         # Pre-screen the canonical (i≤j,k≤l,ij-pair≥kl-pair) quartet work
@@ -311,7 +311,8 @@ function RHFgrad(aoints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.In
                         K = (ao_offset[k]+1):(ao_offset[k]+Nk)
                         L = (ao_offset[l]+1):(ao_offset[l]+Nl)
 
-                        blk = GaussianBasis.∇ERI_2e4c(bset, a, i, j, k, l)
+                        on_A = (on_atom[i], on_atom[j], on_atom[k], on_atom[l])
+                        blk = GaussianBasis.∇ERI_2e4c(bset, on_A, i, j, k, l)
 
                         for q in 1:3
                             bq = @view blk[:,:,:,:,q]
