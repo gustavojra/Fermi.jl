@@ -153,7 +153,7 @@ function RHFhess(ints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.Inte
         RA = responses[iA]
         RB = responses[iB]
 
-        H2e = ERI_hess_JK(bset, P, iA, iB)
+        H2e = ERI_hess_JK(bset, P, iA, iB; σvals=σvals)
         H1e_S = GaussianBasis.∇2overlap(bset, iA, iB)
         H1e_T = GaussianBasis.∇2kinetic(bset, iA, iB)
         H1e_V = GaussianBasis.∇2nuclear(bset, iA, iB)

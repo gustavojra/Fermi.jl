@@ -16,14 +16,12 @@
 #
 # Visits only CANONICAL shell quadruples (i≤j, k≤l, (i,j)-pair ≥ (k,l)-pair --
 # the same restriction RHFgrad.jl's outer loop uses), one `∇2ERI_2e4c` call
-# each, rather than the unrestricted nshells^4 loop (up to 8x more calls) an
-# earlier version of this file used. Getting BOTH C1 and C2's full
-# contribution (summed over all 8 permutation-symmetric arrangements of that
-# quadruple) from that SINGLE call needed its own derivation, verified
-# against a brute-force reference (each of the 8 arrangements computed
-# independently via its own permuted view of the canonical block, exactly as
-# `RHFgrad.jl`'s own `quartet_contribution` derivation was verified) over
-# 1000 random trials before trusting it:
+# each. Getting BOTH C1 and C2's full contribution (summed over all 8
+# permutation-symmetric arrangements of that quadruple) from that SINGLE call
+# needed its own derivation, verified against a brute-force reference (each
+# of the 8 arrangements computed independently via its own permuted view of
+# the canonical block, exactly as `RHFgrad.jl`'s own `quartet_contribution`
+# derivation was verified) over 1000 random trials before trusting it:
 #
 #   C1 (Coulomb-shape, weight P[I,J]⊗P[K,L]) is IDENTICAL across all 8
 #   arrangements -- same result RHFgrad.jl's Coulomb term found. So a
@@ -40,12 +38,36 @@
 #   no-ops, so there's no "cross" arrangement to distinguish).
 #
 # A pleasant side effect: since C1 and C2 now both derive from the SAME
-# canonical block (i,j,k,l) -- not two independent calls
-# (∇2ERI_2e4c(...,p,q,r,s) for C1, ∇2ERI_2e4c(...,p,s,r,q) for C2, a genuinely
+# canonical block (i,j,k,l) -- not two independent calls, a genuinely
 # different integral needing its own Schwarz bound, as an earlier version of
-# this file had to handle) -- one Schwarz screening decision (σ_ij·σ_kl)
-# now correctly covers both terms. There's no longer a "different bound for
-# each term" subtlety to get right.
+# this file had to handle -- one Schwarz screening decision (σ_ij·σ_kl) now
+# correctly covers both terms.
+#
+# Three efficiency fixes found by profiling a real (24-atom caffeine, not a
+# toy 3-atom molecule) system, none of which are visible at toy scale:
+#
+#   1. `σvals` is now an optional kwarg, computed once by RHFhess.jl's main
+#      loop and threaded through, instead of every one of the O(natm^2)
+#      ERI_hess_JK calls recomputing the same O(nshells^2) Schwarz bound
+#      pass from scratch (RHFgrad.jl already avoided this; this file hadn't
+#      been updated to match).
+#
+#   2. Atom membership is checked via a precomputed BitVector (`on_A`/`on_B`,
+#      O(nshells), built once per call) instead of `any(p -> ...
+#      shellval[p]].atom == Aat, 1:4)` -- a closure re-evaluated on every one
+#      of the ~nshells^4/8 canonical quadruples. Profiling a single
+#      ERI_hess_JK call on caffeine/sto-3g (52 shells, so ~950k canonical
+#      quadruples to filter) showed this closure-based check alone consuming
+#      ~26% of total samples -- more than either of the two real libcint
+#      kernels it was gating. RHFgrad.jl's loop already used the cheaper
+#      precomputed-array form; this file hadn't been brought in line with it.
+#
+#   3. Threaded via the same channel-based worker-pool pattern RHFgrad.jl
+#      uses (and, originally, RHFHelper.jl's SparseERI build_fock!): work
+#      items (surviving canonical quadruples) go into a bounded Channel,
+#      each Threads.@spawn'd worker drains chunks into its own local (3,3)
+#      accumulators, summed on the main task only after every worker
+#      finishes. This file had no threading at all until now.
 
 function contract_C1(P, I, J, K, L, blk)
     Pij = @view P[I, J]; Pkl = @view P[K, L]
@@ -75,7 +97,7 @@ function contract_C2_cross(P, I, J, K, L, blk)
 end
 
 """
-    ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int)
+    ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals=nothing)
 
 Two-electron Coulomb+exchange contribution to the RHF Hessian block (iA,iB),
 `0.5*C1 - 0.25*C2` where `C1[x,y] = sum_mnrs P[m,n]*P[r,s]*d2(mn|rs)/dA_x dB_y`
@@ -83,63 +105,109 @@ Two-electron Coulomb+exchange contribution to the RHF Hessian block (iA,iB),
 (exchange-shape) -- matching RHFgrad.jl's existing `0.5*P*P*ERI - 0.25*P*P*ERI`
 gradient contraction one derivative order up. `P` is treated as fixed (the
 converged SCF density); the CPHF density-response contribution is a separate
-term. See this file's header comment for the canonical-quadruple/Schwarz
-strategy.
+term. `σvals` is `GaussianBasis.schwarz_bounds(bset)`'s second return value --
+atom-pair-independent, so callers looping over many `(iA,iB)` pairs (as
+`RHFhess.jl`'s main loop does) should compute it once and pass it through
+rather than paying its O(nshells^2) cost again on every call. See this file's
+header comment for the canonical-quadruple/Schwarz/threading strategy.
 """
-function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int)
+function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals = nothing)
     Nvals = GaussianBasis.num_basis.(bset.basis)
     ao_offset = [sum(Nvals[1:(i-1)]) for i = 1:bset.nshells]
     nshells = bset.nshells
 
-    _, σvals = GaussianBasis.schwarz_bounds(bset)
+    if σvals === nothing
+        _, σvals = GaussianBasis.schwarz_bounds(bset)
+    end
     cutoff = 1e-12
 
     Aat = bset.atoms[iA]
     Bat = bset.atoms[iB]
+    on_A = falses(nshells)
+    on_B = falses(nshells)
+    for s in 1:nshells
+        bset.basis[s].atom == Aat && (on_A[s] = true)
+        bset.basis[s].atom == Bat && (on_B[s] = true)
+    end
 
-    C1 = zeros(3, 3)
-    C2 = zeros(3, 3)
-
+    # Pre-screen the canonical quadruple work list -- Schwarz bound and
+    # atom-membership are both O(1) checks (given precomputed on_A/on_B),
+    # cheap to do up front so worker tasks only ever see quadruples that
+    # need real work.
+    quartets = NTuple{4,Int}[]
     @inbounds for i in 1:nshells, j in i:nshells
-        σij = σvals[GaussianBasis.index2(i-1,j-1)+1]
         ij_idx = GaussianBasis.index2(i-1,j-1)
+        σij = σvals[ij_idx+1]
         for k in 1:nshells, l in k:nshells
             ij_idx < GaussianBasis.index2(k-1,l-1) && continue
             σkl = σvals[GaussianBasis.index2(k-1,l-1)+1]
             σij*σkl <= cutoff && continue
 
-            shellval = (i, j, k, l)
-            any(p -> bset.basis[shellval[p]].atom == Aat, 1:4) || continue
-            any(p -> bset.basis[shellval[p]].atom == Bat, 1:4) || continue
+            (on_A[i]||on_A[j]||on_A[k]||on_A[l]) || continue
+            (on_B[i]||on_B[j]||on_B[k]||on_B[l]) || continue
 
-            Ni, Nj, Nk, Nl = Nvals[i], Nvals[j], Nvals[k], Nvals[l]
-            ioff, joff, koff, loff = ao_offset[i], ao_offset[j], ao_offset[k], ao_offset[l]
-            I = (ioff+1):(ioff+Ni)
-            J = (joff+1):(joff+Nj)
-            K = (koff+1):(koff+Nk)
-            L = (loff+1):(loff+Nl)
+            push!(quartets, (i, j, k, l))
+        end
+    end
 
-            blk_full = GaussianBasis.∇2ERI_2e4c(bset, iA, iB, i, j, k, l)
+    C1 = zeros(3, 3)
+    C2 = zeros(3, 3)
 
-            ij_ne_kl = ij_idx != GaussianBasis.index2(k-1,l-1)
-            mult = (i != j ? 2 : 1) * (k != l ? 2 : 1) * (ij_ne_kl ? 2 : 1)
+    isempty(quartets) && return C1
 
-            for y in 1:3, x in 1:3
-                blk = @view blk_full[:,:,:,:,x,y]
+    ntasks = Threads.nthreads()
+    chunksize = clamp(cld(length(quartets), 4*ntasks), 1, 200)
+    requests = Channel{Vector{NTuple{4,Int}}}(Inf)
+    for chunk in Iterators.partition(quartets, chunksize)
+        put!(requests, collect(chunk))
+    end
+    close(requests)
 
-                C1[x, y] += mult * contract_C1(P, I, J, K, L, blk)
+    results = Channel{Tuple{Matrix{Float64},Matrix{Float64}}}(ntasks)
 
-                if i == j && k == l
-                    Vcan_C2 = contract_C2_canonical(P, I, J, K, L, blk)
-                    C2[x, y] += ij_ne_kl ? 2*Vcan_C2 : Vcan_C2
-                else
-                    Vcan_C2 = contract_C2_canonical(P, I, J, K, L, blk)
-                    Vcross_C2 = contract_C2_cross(P, I, J, K, L, blk)
-                    half = mult ÷ 2
-                    C2[x, y] += half*Vcan_C2 + half*Vcross_C2
+    @sync for _ in 1:ntasks
+        Threads.@spawn begin
+            C1_local = zeros(3, 3)
+            C2_local = zeros(3, 3)
+            for chunk in requests
+                for (i, j, k, l) in chunk
+                    Ni, Nj, Nk, Nl = Nvals[i], Nvals[j], Nvals[k], Nvals[l]
+                    ioff, joff, koff, loff = ao_offset[i], ao_offset[j], ao_offset[k], ao_offset[l]
+                    I = (ioff+1):(ioff+Ni)
+                    J = (joff+1):(joff+Nj)
+                    K = (koff+1):(koff+Nk)
+                    L = (loff+1):(loff+Nl)
+
+                    blk_full = GaussianBasis.∇2ERI_2e4c(bset, iA, iB, i, j, k, l)
+
+                    ij_ne_kl = GaussianBasis.index2(i-1,j-1) != GaussianBasis.index2(k-1,l-1)
+                    mult = (i != j ? 2 : 1) * (k != l ? 2 : 1) * (ij_ne_kl ? 2 : 1)
+
+                    for y in 1:3, x in 1:3
+                        blk = @view blk_full[:,:,:,:,x,y]
+
+                        C1_local[x, y] += mult * contract_C1(P, I, J, K, L, blk)
+
+                        if i == j && k == l
+                            Vcan_C2 = contract_C2_canonical(P, I, J, K, L, blk)
+                            C2_local[x, y] += ij_ne_kl ? 2*Vcan_C2 : Vcan_C2
+                        else
+                            Vcan_C2 = contract_C2_canonical(P, I, J, K, L, blk)
+                            Vcross_C2 = contract_C2_cross(P, I, J, K, L, blk)
+                            half = mult ÷ 2
+                            C2_local[x, y] += half*Vcan_C2 + half*Vcross_C2
+                        end
+                    end
                 end
             end
+            put!(results, (C1_local, C2_local))
         end
+    end
+
+    for _ in 1:ntasks
+        C1_local, C2_local = take!(results)
+        C1 .+= C1_local
+        C2 .+= C2_local
     end
 
     return 0.5 .* C1 .- 0.25 .* C2
