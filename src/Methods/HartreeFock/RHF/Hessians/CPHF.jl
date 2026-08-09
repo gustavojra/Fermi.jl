@@ -135,9 +135,14 @@ end
     cphf_rhs(wfn, ints, iA)
 
 CPHF right-hand side `B_ai^(y)` for all three Cartesian directions of atom
-`iA`, returned as a `(nvir,ndocc,3)` array. Built entirely from existing
-first-derivative integrals (`∇kinetic!`/`∇nuclear!`/`∇overlap!`/
-`eri_grad_JK`) contracted against the converged density -- no
+`iA`, returned as a `(nvir,ndocc,3)` array, alongside the `∂H,∂S,Jq_all,
+Kq_all` intermediates it was built from (`(nbas,nbas,3)` each) -- callers
+that only need `B` can discard the rest, but `_rhf_hess_response` needs
+those same intermediates again for its own `Fskel`/`dF` assembly, so
+returning them here instead of forcing a second, identical
+`∇kinetic!`/`∇nuclear!`/`∇overlap!`/`eri_grad_JK` pass saves real work (see
+`cphf_solve_full`'s docstring). Built entirely from existing
+first-derivative integrals contracted against the converged density -- no
 second-derivative integrals involved (those are the direct/"integral
 response" Hessian piece, `ERI_hess_JK`/the one-electron Hessian code,
 assembled separately).
@@ -178,7 +183,7 @@ function cphf_rhs(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing)
         B[:, :, q] .= Cv' * Fskel * Co .- (Cv' * Sq * Co) * Diagonal(eps_o) .+ Cv' * G * Co
     end
 
-    return B
+    return B, ∂H, ∂S, Jq_all, Kq_all
 end
 
 """
@@ -186,12 +191,45 @@ end
 
 Solve the CPHF equations for the occupied-virtual orbital response
 `U_ai^(y)` to displacing atom `iA`, for all three Cartesian directions,
-returned as a `(nvir,ndocc,3)` array. Solves
-`(εa-εi)U + cphf_Amatvec(U) = -cphf_rhs(...)` via `KrylovKit.linsolve` with
-CG (the orbital Hessian is symmetric positive definite at a true RHF
-minimum), one right-hand side at a time.
+returned as a `(nvir,ndocc,3)` array. Thin wrapper around `cphf_solve_full`
+for callers that only need `U` -- see that function for the solve itself.
 """
 function cphf_solve(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing)
+    U, _, _, _, _ = cphf_solve_full(wfn, ints, iA; ij_vals=ij_vals, σvals=σvals)
+    return U
+end
+
+"""
+    cphf_solve_full(wfn, ints, iA)
+
+Same solve as `cphf_solve`, but also returns `cphf_rhs`'s intermediate
+`∂H,∂S,Jq_all,Kq_all` (the un-summed pieces `B` was built from) alongside
+`U` -- `_rhf_hess_response` needs all of these for its own `Fskel`/`dF`
+assembly, and used to recompute them from scratch via a second
+`∇kinetic!`/`∇nuclear!`/`∇overlap!`/`eri_grad_JK` pass (profiling on a real
+24-atom molecule found this costing ~97s of the ~276s total CPHF time,
+genuinely redundant work since `cphf_rhs` had already computed the exact
+same quantities one call up the stack). Calling this instead of
+`cphf_solve` and threading the extra return values through eliminates that
+duplicate pass entirely.
+
+Solves `(εa-εi)U + cphf_Amatvec(U) = -cphf_rhs(...)` via `KrylovKit.linsolve`
+with CG (the orbital Hessian is symmetric positive definite at a true RHF
+minimum), one right-hand side at a time -- but symmetrically
+Jacobi-preconditioned by `d := sqrt.(εa-εi)` first: profiling found plain CG
+here hitting `cphf_max_iter` (default 50) on ~85% of right-hand sides for a
+real molecule, an operator-conditioning problem (the εa-εi denominators
+span a huge range -- near-degenerate valence pairs to deep-core/high-virtual
+gaps of tens of Hartree) rather than an algorithm bug. Since `M := Δeps.*x +
+cphf_Amatvec(x)` is SPD and `Δeps` is diagonal (trivially invertible), the
+standard fix (used by essentially every CPHF/TDDFT iterative solver,
+including PySCF's Z-vector CPHF) is to solve the congruent, still-SPD
+system `D^-1/2 M D^-1/2 y = D^-1/2 b` (`D:=Diagonal(vec(Δeps))`) instead --
+substituting `x = y./d` throughout turns this into
+`y .+ cphf_Amatvec(y./d)./d = -B./d` (elementwise `./d`, no need to
+materialize `D` or its inverse), recovering `U = y./d` at the end.
+"""
+function cphf_solve_full(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing)
     ndocc = wfn.ndocc
     nbas = size(wfn.orbitals.C, 1)
     nvir = nbas - ndocc
@@ -200,16 +238,18 @@ function cphf_solve(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing)
     Cv = @view C[:, ndocc+1:end]
     eps = wfn.orbitals.eps
     Δeps = eps[ndocc+1:end] .- eps[1:ndocc]'  # (nvir,ndocc), εa - εi
+    d = sqrt.(Δeps)                           # Jacobi/diagonal preconditioner scaling
 
     maxiter = Options.get("cphf_max_iter")
     tol = Options.get("cphf_conv")
 
-    B = cphf_rhs(wfn, ints, iA; ij_vals=ij_vals, σvals=σvals)
+    B, ∂H, ∂S, Jq_all, Kq_all = cphf_rhs(wfn, ints, iA; ij_vals=ij_vals, σvals=σvals)
     U = zeros(nvir, ndocc, 3)
     for q in 1:3
-        matvec(x) = Δeps .* x .+ cphf_Amatvec(x, Co, Cv, ints)
-        sol, info = KrylovKit.linsolve(matvec, -B[:, :, q], zeros(nvir, ndocc), KrylovKit.CG(; maxiter=maxiter, tol=tol))
-        U[:, :, q] .= sol
+        precond_matvec(y) = y .+ cphf_Amatvec(y ./ d, Co, Cv, ints) ./ d
+        rhs = -B[:, :, q] ./ d
+        sol, info = KrylovKit.linsolve(precond_matvec, rhs, zeros(nvir, ndocc), KrylovKit.CG(; maxiter=maxiter, tol=tol))
+        U[:, :, q] .= sol ./ d
     end
-    return U
+    return U, ∂H, ∂S, Jq_all, Kq_all
 end

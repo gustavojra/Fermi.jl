@@ -51,20 +51,9 @@ struct RHFHessResponse
     Kq::Array{Float64,3}  # (nbas,nbas,3) -- sum_rs D[r,s]*d(mr|ns)/dA_q
 end
 
-function _rhf_hess_response(wfn::RHF, ints, bset, iA, Co, Cv, D; ij_vals = nothing, σvals = nothing)
+function _rhf_hess_response(wfn::RHF, ints, bset, iA, Co, Cv; ij_vals = nothing, σvals = nothing)
     nbas = size(Co, 1)
-    U = cphf_solve(wfn, ints, iA; ij_vals=ij_vals, σvals=σvals)
-
-    ∂H = zeros(nbas, nbas, 3)
-    ∂Vtmp = zeros(nbas, nbas, 3)
-    GaussianBasis.∇kinetic!(∂H, bset, iA)
-    GaussianBasis.∇nuclear!(∂Vtmp, bset, iA)
-    ∂H .+= ∂Vtmp
-
-    ∂S = zeros(nbas, nbas, 3)
-    GaussianBasis.∇overlap!(∂S, bset, iA)
-
-    Jq_all, Kq_all = eri_grad_JK(bset, D, iA; ij_vals=ij_vals, σvals=σvals)
+    U, ∂H, ∂S, Jq_all, Kq_all = cphf_solve_full(wfn, ints, iA; ij_vals=ij_vals, σvals=σvals)
 
     dD = zeros(nbas, nbas, 3)
     dF = zeros(nbas, nbas, 3)
@@ -141,11 +130,13 @@ function RHFhess(ints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.Inte
 
     # Schwarz screening bound is atom-independent -- compute it once here
     # rather than paying its O(nshells^2) cost again inside ∇sparseERI_2e4c
-    # for every one of the natm*2 calls below (eri_grad_JK is invoked once
-    # directly per atom and again per atom via cphf_solve->cphf_rhs).
+    # for every one of the natm calls below (eri_grad_JK, called once per
+    # atom from inside cphf_rhs -- cphf_solve_full threads its ∂H/∂S/Jq/Kq
+    # back out to _rhf_hess_response instead of that function recomputing
+    # them a second time, see CPHF.jl's cphf_solve_full docstring).
     ij_vals, σvals = GaussianBasis.schwarz_bounds(bset)
 
-    responses = [_rhf_hess_response(wfn, ints, bset, iA, Co, Cv, D; ij_vals=ij_vals, σvals=σvals) for iA in 1:natm]
+    responses = [_rhf_hess_response(wfn, ints, bset, iA, Co, Cv; ij_vals=ij_vals, σvals=σvals) for iA in 1:natm]
 
     H = zeros(3 * natm, 3 * natm)
 

@@ -181,16 +181,35 @@ function cphf_rhs_df(wfn::RHF, ints, iA::Int, cache)
         B[:, :, q] .= Cv' * Fskel * Co .- (Cv' * Sq * Co) * Diagonal(eps_o) .+ Cv' * G * Co
     end
 
-    return B
+    return B, ∂H, ∂S, Jq_all, Kq_all
 end
 
 """
     cphf_solve_df(wfn, ints, iA, cache)
 
-DF analog of `cphf_solve` (CPHF.jl). `cphf_Amatvec` is reused unchanged --
-it only calls `build_fock!`, already eri_type-generic.
+DF analog of `cphf_solve` (CPHF.jl). Thin wrapper around
+`cphf_solve_df_full` for callers that only need `U`.
 """
 function cphf_solve_df(wfn::RHF, ints, iA::Int, cache)
+    U, _, _, _, _ = cphf_solve_df_full(wfn, ints, iA, cache)
+    return U
+end
+
+"""
+    cphf_solve_df_full(wfn, ints, iA, cache)
+
+DF analog of `cphf_solve_full` (CPHF.jl) -- same relationship to
+`cphf_solve_df` as that function has to `cphf_solve`, same two fixes:
+returns `cphf_rhs_df`'s `∂H,∂S,Jq_all,Kq_all` alongside `U` so
+`_rhf_hess_response_df` doesn't need a second, redundant
+`∇kinetic!`/`∇nuclear!`/`∇overlap!`/`eri_grad_JK_df` pass, and solves the
+symmetrically Jacobi-preconditioned system (scaling by `d := sqrt.(Δeps)`)
+instead of the raw operator -- see `cphf_solve_full`'s docstring for the
+derivation and the profiling that motivated it (identical operator-
+conditioning issue here, `cphf_Amatvec` is shared unchanged between the
+exact-ERI and DF paths).
+"""
+function cphf_solve_df_full(wfn::RHF, ints, iA::Int, cache)
     ndocc = wfn.ndocc
     nbas = size(wfn.orbitals.C, 1)
     nvir = nbas - ndocc
@@ -199,18 +218,20 @@ function cphf_solve_df(wfn::RHF, ints, iA::Int, cache)
     Cv = @view C[:, ndocc+1:end]
     eps = wfn.orbitals.eps
     Δeps = eps[ndocc+1:end] .- eps[1:ndocc]'
+    d = sqrt.(Δeps)
 
     maxiter = Options.get("cphf_max_iter")
     tol = Options.get("cphf_conv")
 
-    B = cphf_rhs_df(wfn, ints, iA, cache)
+    B, ∂H, ∂S, Jq_all, Kq_all = cphf_rhs_df(wfn, ints, iA, cache)
     U = zeros(nvir, ndocc, 3)
     for q in 1:3
-        matvec(x) = Δeps .* x .+ cphf_Amatvec(x, Co, Cv, ints)
-        sol, info = KrylovKit.linsolve(matvec, -B[:, :, q], zeros(nvir, ndocc), KrylovKit.CG(; maxiter=maxiter, tol=tol))
-        U[:, :, q] .= sol
+        precond_matvec(y) = y .+ cphf_Amatvec(y ./ d, Co, Cv, ints) ./ d
+        rhs = -B[:, :, q] ./ d
+        sol, info = KrylovKit.linsolve(precond_matvec, rhs, zeros(nvir, ndocc), KrylovKit.CG(; maxiter=maxiter, tol=tol))
+        U[:, :, q] .= sol ./ d
     end
-    return U
+    return U, ∂H, ∂S, Jq_all, Kq_all
 end
 
 # --- Phase 4: DF "direct" (P frozen) second-derivative term ---
@@ -351,18 +372,7 @@ end
 function _rhf_hess_response_df(wfn::RHF, ints, cache, iA, Co, Cv)
     bset = cache.bset
     nbas = bset.nbas
-    U = cphf_solve_df(wfn, ints, iA, cache)
-
-    ∂H = zeros(nbas, nbas, 3)
-    ∂Vtmp = zeros(nbas, nbas, 3)
-    GaussianBasis.∇kinetic!(∂H, bset, iA)
-    GaussianBasis.∇nuclear!(∂Vtmp, bset, iA)
-    ∂H .+= ∂Vtmp
-
-    ∂S = zeros(nbas, nbas, 3)
-    GaussianBasis.∇overlap!(∂S, bset, iA)
-
-    Jq_all, Kq_all = eri_grad_JK_df(cache, iA)
+    U, ∂H, ∂S, Jq_all, Kq_all = cphf_solve_df_full(wfn, ints, iA, cache)
 
     dD = zeros(nbas, nbas, 3)
     dF = zeros(nbas, nbas, 3)
