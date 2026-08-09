@@ -115,6 +115,7 @@ function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals
     Nvals = GaussianBasis.num_basis.(bset.basis)
     ao_offset = [sum(Nvals[1:(i-1)]) for i = 1:bset.nshells]
     nshells = bset.nshells
+    Nmax = maximum(Nvals)
 
     if σvals === nothing
         _, σvals = GaussianBasis.schwarz_bounds(bset)
@@ -173,6 +174,17 @@ function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals
         Threads.@spawn begin
             C1_local = zeros(3, 3)
             C2_local = zeros(3, 3)
+            # Per-task scratch, reused across every quartet this worker ever
+            # sees -- mirrors RHFgrad.jl's fix for the same allocation
+            # pattern (see GaussianBasis.jl's scratch-buffer ∇2ERI_2e4c!
+            # docstring); this loop calls it up to 16x per quartet (4x4
+            # posA/posB combinations) versus the gradient's 4 branches, so
+            # the old allocating path cost proportionally more here.
+            out_buf = zeros(Nmax, Nmax, Nmax, Nmax, 3, 3)
+            cint_buf = zeros(Cdouble, 9*Nmax^4)
+            cint_t1 = zeros(Cdouble, 9*Nmax^4)
+            cint_t2 = zeros(Cdouble, 9*Nmax^4)
+            shls_buf = zeros(Cint, 4)
             for chunk in requests
                 for (i, j, k, l) in chunk
                     Ni, Nj, Nk, Nl = Nvals[i], Nvals[j], Nvals[k], Nvals[l]
@@ -184,7 +196,8 @@ function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals
 
                     Xflag = (on_A[i], on_A[j], on_A[k], on_A[l])
                     Yflag = (on_B[i], on_B[j], on_B[k], on_B[l])
-                    blk_full = GaussianBasis.∇2ERI_2e4c(bset, Xflag, Yflag, i, j, k, l)
+                    blk_full = @view out_buf[1:Ni, 1:Nj, 1:Nk, 1:Nl, :, :]
+                    GaussianBasis.∇2ERI_2e4c!(blk_full, bset, Xflag, Yflag, i, j, k, l, cint_buf, cint_t1, cint_t2, shls_buf)
 
                     ij_ne_kl = GaussianBasis.index2(i-1,j-1) != GaussianBasis.index2(k-1,l-1)
                     mult = (i != j ? 2 : 1) * (k != l ? 2 : 1) * (ij_ne_kl ? 2 : 1)
