@@ -61,6 +61,11 @@ get_uhf_alg(x::Val{2}) = UHFDirect()
 # Gradient methods
 include("Gradients/UHFgrad.jl")
 
+# Hessian methods
+include("Hessians/UCPHF.jl")
+include("Hessians/TwoElectronHess.jl")
+include("Hessians/UHFhess.jl")
+
 function string_repr(X::UHF)
     out = ""
     out = out*" ⇒ Fermi Unrestricted Hartree--Fock Wave function\n"

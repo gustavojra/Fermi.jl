@@ -1,3 +1,5 @@
+using Molecules
+
 @reset
 @set printstyle none
 
@@ -161,6 +163,129 @@ Edf =   [-75.41960080317435, -39.56380446089254, -38.93785583198393]
             @test isfinite(wfn.energy)
             g = Fermi.HartreeFock.UHFgrad(wfn)
             @test all(iszero, g)
+        end
+    end
+
+    @reset
+    @set printstyle none
+    @testset "Hessian" begin
+
+        # Closed-shell reduction: same rationale as the Gradients testset's
+        # version -- UHF forced on a closed-shell singlet must reduce to
+        # Dα=Dβ and reproduce the already-validated RHF Hessian to near
+        # machine precision. Also the check that caught a real bug during
+        # development: UCPHF's Fskel used RHF's CPHF.jl's `2*Jq` coefficient
+        # verbatim, but UHF's Fα=H+Jtot-Kα already has Jtot built directly
+        # from Dtot (no extra factor belongs there) -- this test's diff went
+        # from ~2.4 to ~2e-11 once that was fixed.
+        @testset "Closed-shell reduction to RHF" begin
+            Fermi.Options.set("molstring", """
+            O        0.000000000000     0.000000000000     0.000000000000
+            H        0.000000000000     0.000000000000     0.950000000000
+            H        0.895669800000     0.000000000000    -0.316663000000
+            """)
+            Fermi.Options.set("basis", "sto-3g")
+            Fermi.Options.set("charge", 0)
+            Fermi.Options.set("multiplicity", 1)
+
+            rhf_wfn = @energy rhf
+            rhf_H = Fermi.HartreeFock.RHFhess(rhf_wfn)
+
+            uhf_wfn = Fermi.HartreeFock.UHF()
+            uhf_H = Fermi.HartreeFock.UHFhess(uhf_wfn)
+
+            @test uhf_H ≈ uhf_H' atol=1e-9
+            @test maximum(abs.(uhf_H .- rhf_H)) < 1e-8
+        end
+
+        # Independent, open-shell check: finite difference of Fermi's own
+        # analytic UHF gradient (already validated above), same pattern
+        # test_hessian.jl's RHF version uses.
+        @testset "Finite difference (open-shell)" begin
+            Fermi.Options.set("molstring", """
+            O   0.000000000000   0.000000000000   0.000000000000
+            H   0.000000000000   0.000000000000   0.970000000000
+            """)
+            basis = "sto-3g"
+            Fermi.Options.set("basis", basis)
+            Fermi.Options.set("charge", 0)
+            Fermi.Options.set("multiplicity", 2)
+
+            wf = Fermi.HartreeFock.UHF()
+            H = Fermi.HartreeFock.UHFhess(wf)
+            @test H ≈ H' atol=1e-10
+
+            function displaced_molstring(atoms, iA, k, delta)
+                newatoms = deepcopy(atoms)
+                xyz = collect(newatoms[iA].xyz)
+                xyz[k] += delta
+                newatoms[iA] = Molecules.Atom(newatoms[iA].Z, newatoms[iA].mass, xyz)
+                return join(["$(Int(a.Z))   $(a.xyz[1])   $(a.xyz[2])   $(a.xyz[3])" for a in newatoms], "\n")
+            end
+
+            function uhf_grad(molstring)
+                Fermi.Options.set("molstring", molstring)
+                Fermi.Options.set("basis", basis)
+                Fermi.Options.set("charge", 0)
+                Fermi.Options.set("multiplicity", 2)
+                wf_ = Fermi.HartreeFock.UHF()
+                return Fermi.HartreeFock.UHFgrad(wf_)
+            end
+
+            atoms = wf.molecule.atoms
+            natm = length(atoms)
+            B2A = Molecules.bohr_to_angstrom
+            h = 5e-4
+            H_FD = zeros(3*natm, 3*natm)
+            for iB in 1:natm, qB in 1:3
+                gp = uhf_grad(displaced_molstring(atoms, iB, qB, h))
+                gm = uhf_grad(displaced_molstring(atoms, iB, qB, -h))
+                H_FD[:, 3*(iB-1)+qB] .= vec(((gp .- gm) ./ (2h/B2A))')
+            end
+            @test H ≈ H_FD atol=1e-5
+        end
+
+        # Fresh Psi4 UHF Hessian reference (scf_type pk, matching Fermi's
+        # exact-ERI dispatch), oh/cc-pvtz -- same system the gradient's
+        # Psi4-reference testset uses.
+        @testset "Psi4 reference (exact-ERI)" begin
+            path = joinpath(@__DIR__, "xyz/oh.xyz")
+            mol = open(f->read(f,String), path)
+            Fermi.Options.set("df", false)
+            Fermi.Options.set("molstring", mol)
+            Fermi.Options.set("basis", "cc-pvtz")
+            Fermi.Options.set("reference", "uhf")
+            Fermi.Options.set("charge", 0)
+            Fermi.Options.set("multiplicity", 2)
+
+            wfn = Fermi.HartreeFock.UHF()
+            H = Fermi.HartreeFock.UHFhess(wfn)
+
+            H_psi4 = [
+             -0.00006725075105  0.0                 0.0                 0.00006725075183   0.0                 0.0
+              0.0               -0.00006724582223    0.0                 0.0                 0.00006724582304    0.0
+              0.0                0.0                 0.58571680342079    0.0                 0.0                -0.58571680342115
+              0.00006725075183   0.0                 0.0                -0.00006725075189   0.0                 0.0
+              0.0                0.00006724582304    0.0                 0.0                -0.00006724582306    0.0
+              0.0                0.0                -0.58571680342115    0.0                 0.0                 0.58571680342118
+            ]
+            @test maximum(abs.(H .- H_psi4)) < 1e-7
+        end
+
+        # Nβ=0 edge case: bare doublet H atom. Hessian must be exactly zero
+        # (single atom, translational invariance) and finite (no NaN from
+        # the odadamping bug the gradient testset already regression-tests,
+        # or from any UCPHF-side empty-spin-channel edge case).
+        @testset "Nβ=0 edge case" begin
+            Fermi.Options.set("df", false)
+            Fermi.Options.set("molstring", "H 0.0 0.0 0.0")
+            Fermi.Options.set("basis", "cc-pvdz")
+            Fermi.Options.set("charge", 0)
+            Fermi.Options.set("multiplicity", 2)
+
+            wfn = Fermi.HartreeFock.UHF()
+            H = Fermi.HartreeFock.UHFhess(wfn)
+            @test all(x -> isfinite(x) && abs(x) < 1e-8, H)
         end
     end
 end
