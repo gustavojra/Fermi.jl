@@ -217,7 +217,16 @@ function odadamping(D, Ds, F, Fs)
     dD = D - Ds
     s = tr(Fs * dD)
     c = tr((F - Fs) * (dD))
-    if c <= -s/(2*c)
+    if c == 0.0
+        # dD is identically zero (e.g. an empty spin channel, Nβ=0 -- that
+        # density never has anything to build it from, so it stays exactly
+        # zero across every iteration): the quadratic damping model's
+        # linear and quadratic coefficients (s, c) both vanish, so every λ
+        # leaves D and F unchanged. Take the full step (matches the c<=0
+        # boundary case below) instead of evaluating -s/(2*c), which would
+        # be a literal 0/0 NaN in the branch condition itself.
+        λ = 1.0
+    elseif c <= -s/(2*c)
         λ = 1.0
     else
         λ = -s/(2*c)
