@@ -287,5 +287,31 @@ Edf =   [-75.41960080317435, -39.56380446089254, -38.93785583198393]
             H = Fermi.HartreeFock.UHFhess(wfn)
             @test all(x -> isfinite(x) && abs(x) < 1e-8, H)
         end
+
+        @testset "@hessian / @frequencies macro dispatch" begin
+            Fermi.Options.set("molstring", """
+            O        0.000000000000     0.000000000000     0.000000000000
+            H        0.000000000000     0.000000000000     0.950000000000
+            H        0.895669800000     0.000000000000    -0.316663000000
+            """)
+            Fermi.Options.set("basis", "sto-3g")
+            Fermi.Options.set("charge", 0)
+            Fermi.Options.set("multiplicity", 1)
+
+            wfn = Fermi.HartreeFock.UHF()
+            H_direct = Fermi.HartreeFock.UHFhess(wfn)
+            H_macro = @hessian wfn => uhf
+            @test H_macro ≈ H_direct atol=1e-12
+
+            freqs_ref, modes_ref = vibrational_analysis(H_direct, wfn.molecule)
+            freqs, modes = @frequencies wfn => uhf
+            @test freqs ≈ freqs_ref atol=1e-8
+            @test modes ≈ modes_ref atol=1e-8
+
+            # @frequency is an alias for @frequencies -- same result
+            freqs2, modes2 = @frequency wfn => uhf
+            @test freqs2 ≈ freqs_ref atol=1e-8
+            @test modes2 ≈ modes_ref atol=1e-8
+        end
     end
 end

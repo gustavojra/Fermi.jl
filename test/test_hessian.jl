@@ -611,6 +611,16 @@ using TensorOperations
         # agreement -- already essentially machine-converged (gradient <1e-8).
         @test vib_freqs ≈ [2170.04597272, 4140.00188775, 4391.06663761] atol=1.0
 
+        # @frequencies combines the two calls above into one; @frequency is
+        # a plain alias for it (same behavior, different name).
+        freqs_f, modes_f = @frequencies wf => rhf
+        @test freqs_f ≈ freqs atol=1e-10
+        @test modes_f ≈ modes atol=1e-10
+
+        freqs_f2, modes_f2 = @frequency wf => rhf
+        @test freqs_f2 ≈ freqs atol=1e-10
+        @test modes_f2 ≈ modes atol=1e-10
+
         # Linear molecule sanity check: only 5 (not 6) trans/rot zero modes,
         # since rotation about the molecular axis isn't a physical DOF.
         Fermi.Options.set("molstring", """

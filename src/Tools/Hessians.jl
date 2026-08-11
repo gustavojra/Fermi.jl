@@ -1,11 +1,44 @@
 using LinearAlgebra
 using Molecules
 
-export @hessian, vibrational_analysis
+export @hessian, @frequencies, @frequency, vibrational_analysis
 
 h_dict = Dict{String, String}(
-    "rhf" => "Fermi.HartreeFock.RHFhess()"
+    "rhf" => "Fermi.HartreeFock.RHFhess()",
+    "uhf" => "Fermi.HartreeFock.UHFhess()"
 )
+
+# Shared arg-parsing for @hessian/@frequencies: turns the "wfn => rhf" /
+# "aoints, wfn => rhf" / "rhf" syntax into (call-expression-string, arg-string).
+function _hessian_out_and_arg(comm)
+    clean_up(s) = String(filter(c->!occursin(c," :"),s))
+    A = clean_up(repr(comm))
+
+    while A[1] == '(' && A[end] == ')'
+        A = A[2:end-1]
+    end
+
+    if occursin("=>", A)
+        arg, method = split(A, "=>")
+    elseif occursin("<=", A)
+        method, arg = split(A, "<=")
+    else
+        method = A
+        arg = ""
+    end
+
+    method = lowercase(String(method))
+    arg = String(arg)
+
+    out = ""
+    try
+        out = replace(h_dict[method], "()" => "("*arg*")")
+    catch KeyError
+        throw(FermiException("Invalid or unsupported method for Hessian computation: \"$A\""))
+    end
+
+    return out, arg
+end
 
 """
     Fermi.@hessian
@@ -40,37 +73,58 @@ hess = @hessian aoints, wfn => rhf
     Method   Description
     ------   -----------
     RHF      Restricted Hartree-Fock, fully analytic (integrals + CPHF).
+    UHF      Unrestricted Hartree-Fock, fully analytic (integrals + UCPHF).
 """
 macro hessian(comm)
-    clean_up(s) = String(filter(c->!occursin(c," :"),s))
-    A = clean_up(repr(comm))
-
-    while A[1] == '(' && A[end] == ')'
-        A = A[2:end-1]
-    end
-
-    if occursin("=>", A)
-        arg, method = split(A, "=>")
-    elseif occursin("<=", A)
-        method, arg = split(A, "<=")
-    else
-        method = A
-        arg = ""
-    end
-
-    method = lowercase(String(method))
-    arg = String(arg)
-
-    out = ""
-    try
-        out = replace(h_dict[method], "()" => "("*arg*")")
-    catch KeyError
-        throw(FermiException("Invalid or unsupported method for Hessian computation: \"$A\""))
-    end
-
+    out, _ = _hessian_out_and_arg(comm)
     expr_out = Meta.parse(out)
-
     return esc(expr_out)
+end
+
+"""
+    Fermi.@frequencies
+
+Macro combining `@hessian` and `vibrational_analysis` in one call: computes the analytic
+Hessian and immediately runs the mass-weighted vibrational analysis on it, printing and
+returning the harmonic frequencies. Same argument syntax as `@hessian` -- a wave function
+is required (its `.molecule` is used for the mass-weighting/projection step).
+
+# Examples
+
+```
+freqs, modes = @frequencies wfn => rhf
+```
+
+```
+aoints = Fermi.Integrals.IntegralHelper()
+wfn = @energy aoints => rhf
+freqs, modes = @frequencies aoints, wfn => rhf
+```
+
+See `@hessian` for the full list of implemented methods, and `vibrational_analysis` for
+the meaning of the returned `(freqs, modes)`.
+"""
+macro frequencies(comm)
+    out, arg = _hessian_out_and_arg(comm)
+
+    wfn_str = String(split(arg, ",")[end])
+    if isempty(wfn_str)
+        throw(FermiException("Fermi.@frequencies requires a wave function argument (e.g. `@frequencies wfn => rhf`), since it needs wfn.molecule for the vibrational analysis."))
+    end
+
+    hess_expr = Meta.parse(out)
+    wfn_expr = Meta.parse(wfn_str)
+
+    return esc(:(Fermi.vibrational_analysis($hess_expr, $wfn_expr.molecule)))
+end
+
+"""
+    Fermi.@frequency
+
+Alias for `@frequencies` (same behavior, arguments, and return value).
+"""
+macro frequency(comm)
+    return esc(:(@frequencies($comm)))
 end
 
 """
