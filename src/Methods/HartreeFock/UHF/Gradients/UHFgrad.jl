@@ -127,12 +127,9 @@ end
 """
     UHFgrad(aoints::IntegralHelper{Float64,<:Union{Chonky,SparseERI}}, wfn::UHF)
 
-Analytic UHF gradient for the exact-ERI case. Direct generalization of
-`RHFgrad`'s exact-ERI dispatch (`RHF/Gradients/RHFgrad.jl`) to two spin
-densities -- same integral-direct/canonical-quadruple/Schwarz-screened/
-channel-worker-pool structure, see this file's header comment for the
-two-electron formula generalization and that file's for everything else
-(unchanged: threading pattern, scratch-buffer discipline, screening).
+Analytic UHF gradient for the exact-ERI case. Returns the Cartesian
+gradient as a `(Natoms, 3)` matrix, atomic units. See `RHFgrad.jl` for the
+RHF version this generalizes.
 """
 function UHFgrad(aoints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.Integrals.Chonky,Fermi.Integrals.SparseERI}}, wfn::UHF)
 

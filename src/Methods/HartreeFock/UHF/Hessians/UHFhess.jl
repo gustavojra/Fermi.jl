@@ -95,11 +95,8 @@ end
     UHFhess(aoints::IntegralHelper{Float64,<:Union{Chonky,SparseERI}}, wfn::UHF)
 
 Full analytic UHF Hessian (Cartesian, `3*Natoms x 3*Natoms`, atomic units).
-Solves UCPHF once per atom (batched over that atom's 3 directions) and
-combines the density/orbital-energy response with the direct
-(integral-only) second-derivative pieces -- direct generalization of
-`RHFhess(aoints,wfn)` to two spin densities, see this file's header
-comment for the term-by-term derivation.
+See `RHFhess.jl` for the RHF version this generalizes, and this file's
+header comment for the term-by-term derivation.
 """
 function UHFhess(ints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.Integrals.Chonky,Fermi.Integrals.SparseERI}}, wfn::UHF)
     molecule = wfn.molecule

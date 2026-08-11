@@ -33,11 +33,7 @@
 Two-electron "response Fock" contraction used as the CPHF orbital-Hessian
 matrix-vector product A*U. `U` is a trial occupied-virtual rotation, shape
 `(nvir,ndocc)`; `Co`, `Cv` are the occupied/virtual blocks of the MO
-coefficient matrix. Builds the symmetric trial AO density
-`ΔD = Cv*U*Co' + Co*U'*Cv'`, then reuses `build_fock!`'s existing J/K
-dispatch (Chonky/DF/SparseERI, whichever `ints` carries) with a zero
-one-electron piece to get `ΔF` -- see this file's header for why that's
-exactly the CPHF coupling matrix in disguise.
+coefficient matrix. See this file's header comment for the derivation.
 """
 function build_response_fock!(ΔF, U, Co, Cv, ints)
     ΔD = Cv * U * Co'
@@ -47,20 +43,13 @@ function build_response_fock!(ΔF, U, Co, Cv, ints)
     return ΔF
 end
 
-"""
-    build_response_fock!(ΔF, U, Co, Cv, ints, ΔD, H0, tmp)
-
-Scratch-buffer-accepting core: `ΔD` (nbas,nbas), `H0` (nbas,nbas, always
-zero -- `build_fock!` only reads it), `tmp` (nbas,ndocc) are caller-owned
-and reused across calls instead of allocating fresh -- this is the CPHF
-matrix-vector product, called once per CG iteration (up to `cphf_max_iter`
-times) per Cartesian direction per atom, so the old allocating form's
-`ΔD`/`H0` (each `zeros(nbas,nbas)`) added up over a full Hessian the same
-way the gradient's/direct-Hessian's per-quartet allocation did (see
-`RHFgrad.jl`'s and `GaussianBasis.jl`'s scratch-buffer docstrings for that
-earlier fix) -- smaller in absolute magnitude here (O(cphf_max_iter*3*natm)
-calls, not O(nshells^4)), but the same avoidable churn.
-"""
+# Scratch-buffer core: ΔD/H0/tmp are caller-owned, reused across calls
+# instead of allocating fresh. This is the CPHF matrix-vector product,
+# called once per CG iteration (up to cphf_max_iter times) per Cartesian
+# direction per atom, so the old allocating form's fresh zeros(nbas,nbas)
+# added up the same way the gradient's/direct-Hessian's per-quartet
+# allocation did (see RHFgrad.jl's and GaussianBasis.jl's scratch-buffer
+# docstrings) -- smaller in absolute magnitude here, same avoidable churn.
 function build_response_fock!(ΔF, U, Co, Cv, ints, ΔD, H0, tmp)
     mul!(tmp, Cv, U)
     mul!(ΔD, tmp, Co')
@@ -84,15 +73,9 @@ function cphf_Amatvec(U, Co, Cv, ints)
     return Cv' * ΔF * Co
 end
 
-"""
-    cphf_Amatvec!(result, U, Co, Cv, ints, ΔF, ΔD, H0, tmp, tmp2)
-
-Scratch-buffer-accepting core of `cphf_Amatvec` -- `result` (nvir,ndocc,
-written in place and returned), `ΔF` (nbas,nbas), `tmp2` (nvir,nbas) are
-caller-owned alongside `build_response_fock!`'s own `ΔD`/`H0`/`tmp`. See
-that function's docstring for the motivation (this is its caller, once per
-CG iteration).
-"""
+# Scratch-buffer core of cphf_Amatvec, called once per CG iteration --
+# result/ΔF/tmp2 are caller-owned alongside build_response_fock!'s own
+# ΔD/H0/tmp, same motivation as that function's scratch-buffer overload.
 function cphf_Amatvec!(result, U, Co, Cv, ints, ΔF, ΔD, H0, tmp, tmp2)
     build_response_fock!(ΔF, U, Co, Cv, ints, ΔD, H0, tmp)
     mul!(tmp2, Cv', ΔF)
@@ -134,21 +117,18 @@ against a density-like matrix `D`, for all three Cartesian directions of
 atom `iA`: `Jq[m,n] = sum_rs D[r,s]*d(mn|rs)/dA_q`, `Kq[m,n] = sum_rs
 D[r,s]*d(mr|ns)/dA_q`. Returned as two `(nbas,nbas,3)` arrays.
 
-Built directly from `GaussianBasis.∇sparseERI_2e4c`'s compressed
-(permutation-unique) derivative list -- never materializes the dense
-`(nbas,nbas,nbas,nbas,3)` derivative ERI tensor `∇ERI_2e4c!` would. For
-each stored unique quartet, accumulates into `Jq`/`Kq` over the
-(deduplicated) 8-member index-permutation orbit that shares its value;
-validated against the dense `∇ERI_2e4c!`-based reference to machine
-precision (both sto-3g and cc-pVDZ, several atoms) before use here.
-
-`ij_vals`/`σvals` are `∇sparseERI_2e4c`'s Schwarz screening bound
-(`GaussianBasis.schwarz_bounds(bset)`), atom-independent -- callers looping
-over every atom (this function is called once per atom, twice per atom
-counting `cphf_rhs`'s own call inside `cphf_solve`) should compute it once
-and pass it through rather than recomputing it on every call.
+`ij_vals`/`σvals` (`GaussianBasis.schwarz_bounds(bset)`) are optional and
+atom-independent -- callers looping over many atoms should compute them
+once and pass them through rather than recomputing per call.
 """
 function eri_grad_JK(bset::BasisSet, D::AbstractMatrix, iA::Int; ij_vals = nothing, σvals = nothing)
+    # Built directly from GaussianBasis.∇sparseERI_2e4c's compressed
+    # (permutation-unique) derivative list -- never materializes the dense
+    # (nbas,nbas,nbas,nbas,3) tensor ∇ERI_2e4c! would. For each stored
+    # unique quartet, accumulates into Jq/Kq over the (deduplicated)
+    # 8-member index-permutation orbit that shares its value; validated
+    # against the dense ∇ERI_2e4c!-based reference to machine precision
+    # (sto-3g and cc-pVDZ, several atoms) before use here.
     nbas = bset.nbas
     Jq = zeros(nbas, nbas, 3)
     Kq = zeros(nbas, nbas, 3)
@@ -174,18 +154,15 @@ end
 
 CPHF right-hand side `B_ai^(y)` for all three Cartesian directions of atom
 `iA`, returned as a `(nvir,ndocc,3)` array, alongside the `∂H,∂S,Jq_all,
-Kq_all` intermediates it was built from (`(nbas,nbas,3)` each) -- callers
-that only need `B` can discard the rest, but `_rhf_hess_response` needs
-those same intermediates again for its own `Fskel`/`dF` assembly, so
-returning them here instead of forcing a second, identical
-`∇kinetic!`/`∇nuclear!`/`∇overlap!`/`eri_grad_JK` pass saves real work (see
-`cphf_solve_full`'s docstring). Built entirely from existing
-first-derivative integrals contracted against the converged density -- no
-second-derivative integrals involved (those are the direct/"integral
-response" Hessian piece, `ERI_hess_JK`/the one-electron Hessian code,
-assembled separately).
+Kq_all` intermediates it was built from (`(nbas,nbas,3)` each).
 """
 function cphf_rhs(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing)
+    # ∂H/∂S/Jq_all/Kq_all are returned (not just B) because
+    # _rhf_hess_response needs those same intermediates again for its own
+    # Fskel/dF assembly -- returning them here instead of forcing a second,
+    # identical ∇kinetic!/∇nuclear!/∇overlap!/eri_grad_JK pass saved ~97s
+    # of ~276s total CPHF time on a real 24-atom molecule (see
+    # cphf_solve_full's comment).
     bset = BasisSet(wfn.orbitals.basis, wfn.molecule.atoms)
     nbas = bset.nbas
     ndocc = wfn.ndocc
@@ -241,33 +218,29 @@ end
     cphf_solve_full(wfn, ints, iA)
 
 Same solve as `cphf_solve`, but also returns `cphf_rhs`'s intermediate
-`∂H,∂S,Jq_all,Kq_all` (the un-summed pieces `B` was built from) alongside
-`U` -- `_rhf_hess_response` needs all of these for its own `Fskel`/`dF`
-assembly, and used to recompute them from scratch via a second
-`∇kinetic!`/`∇nuclear!`/`∇overlap!`/`eri_grad_JK` pass (profiling on a real
-24-atom molecule found this costing ~97s of the ~276s total CPHF time,
-genuinely redundant work since `cphf_rhs` had already computed the exact
-same quantities one call up the stack). Calling this instead of
-`cphf_solve` and threading the extra return values through eliminates that
-duplicate pass entirely.
-
-Solves `(εa-εi)U + cphf_Amatvec(U) = -cphf_rhs(...)` via `KrylovKit.linsolve`
-with CG (the orbital Hessian is symmetric positive definite at a true RHF
-minimum), one right-hand side at a time -- but symmetrically
-Jacobi-preconditioned by `d := sqrt.(εa-εi)` first: profiling found plain CG
-here hitting `cphf_max_iter` (default 50) on ~85% of right-hand sides for a
-real molecule, an operator-conditioning problem (the εa-εi denominators
-span a huge range -- near-degenerate valence pairs to deep-core/high-virtual
-gaps of tens of Hartree) rather than an algorithm bug. Since `M := Δeps.*x +
-cphf_Amatvec(x)` is SPD and `Δeps` is diagonal (trivially invertible), the
-standard fix (used by essentially every CPHF/TDDFT iterative solver,
-including PySCF's Z-vector CPHF) is to solve the congruent, still-SPD
-system `D^-1/2 M D^-1/2 y = D^-1/2 b` (`D:=Diagonal(vec(Δeps))`) instead --
-substituting `x = y./d` throughout turns this into
-`y .+ cphf_Amatvec(y./d)./d = -B./d` (elementwise `./d`, no need to
-materialize `D` or its inverse), recovering `U = y./d` at the end.
+`∂H,∂S,Jq_all,Kq_all` alongside `U`, for callers (like `_rhf_hess_response`)
+that need those too. Solves `(εa-εi)U + cphf_Amatvec(U) = -cphf_rhs(...)`
+via `KrylovKit.linsolve` with (Jacobi-preconditioned) CG.
 """
 function cphf_solve_full(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing)
+    # Returning ∂H/∂S/Jq_all/Kq_all here (not just U) lets _rhf_hess_response
+    # reuse them instead of recomputing via a second ∇kinetic!/∇nuclear!/
+    # ∇overlap!/eri_grad_JK pass -- profiling a real 24-atom molecule found
+    # that redundant pass costing ~97s of ~276s total CPHF time.
+    #
+    # Preconditioning: plain CG on (εa-εi).*x + cphf_Amatvec(x) was found
+    # (via profiling) to hit cphf_max_iter (default 50) on ~85% of
+    # right-hand sides for a real molecule -- an operator-conditioning
+    # problem (the εa-εi denominators span a huge range, from near-
+    # degenerate valence pairs to deep-core/high-virtual gaps of tens of
+    # Hartree), not an algorithm bug. Since M := Δeps.*x + cphf_Amatvec(x)
+    # is SPD and Δeps is diagonal (trivially invertible), the standard fix
+    # (used by essentially every CPHF/TDDFT iterative solver, including
+    # PySCF's Z-vector CPHF) is to solve the congruent, still-SPD system
+    # D^-1/2 M D^-1/2 y = D^-1/2 b (D:=Diagonal(vec(Δeps))) instead --
+    # substituting x = y./d turns this into
+    # y .+ cphf_Amatvec(y./d)./d = -B./d (elementwise ./d, no need to
+    # materialize D or its inverse), recovering U = y./d at the end.
     ndocc = wfn.ndocc
     nbas = size(wfn.orbitals.C, 1)
     nvir = nbas - ndocc

@@ -99,17 +99,14 @@ end
 """
     ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals=nothing)
 
-Two-electron Coulomb+exchange contribution to the RHF Hessian block (iA,iB),
-`0.5*C1 - 0.25*C2` where `C1[x,y] = sum_mnrs P[m,n]*P[r,s]*d2(mn|rs)/dA_x dB_y`
-(Coulomb-shape) and `C2[x,y] = sum_mnrs P[m,n]*P[r,s]*d2(ms|rn)/dA_x dB_y`
-(exchange-shape) -- matching RHFgrad.jl's existing `0.5*P*P*ERI - 0.25*P*P*ERI`
-gradient contraction one derivative order up. `P` is treated as fixed (the
-converged SCF density); the CPHF density-response contribution is a separate
-term. `σvals` is `GaussianBasis.schwarz_bounds(bset)`'s second return value --
-atom-pair-independent, so callers looping over many `(iA,iB)` pairs (as
-`RHFhess.jl`'s main loop does) should compute it once and pass it through
-rather than paying its O(nshells^2) cost again on every call. See this file's
-header comment for the canonical-quadruple/Schwarz/threading strategy.
+Two-electron Coulomb+exchange contribution to the RHF Hessian block
+`(iA,iB)`, `0.5*C1 - 0.25*C2` where `C1[x,y] = sum_mnrs
+P[m,n]*P[r,s]*d2(mn|rs)/dA_x dB_y` (Coulomb-shape) and `C2[x,y] = sum_mnrs
+P[m,n]*P[r,s]*d2(ms|rn)/dA_x dB_y` (exchange-shape). `P` is treated as
+fixed (the converged SCF density); the CPHF density-response contribution
+is assembled separately. `σvals` (optional, `GaussianBasis.schwarz_bounds(bset)`)
+is atom-pair-independent -- callers looping over many `(iA,iB)` pairs
+should compute it once and pass it through.
 """
 function ERI_hess_JK(bset::BasisSet, P::AbstractMatrix, iA::Int, iB::Int; σvals = nothing)
     Nvals = GaussianBasis.num_basis.(bset.basis)

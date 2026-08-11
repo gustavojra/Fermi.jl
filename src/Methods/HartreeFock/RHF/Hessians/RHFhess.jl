@@ -98,19 +98,14 @@ end
 """
     RHFhess(aoints::IntegralHelper{Float64,<:Union{Chonky,SparseERI}}, wfn::RHF)
 
-Full analytic RHF Hessian (Cartesian, `3*Natoms x 3*Natoms`, atomic units).
-Solves CPHF once per atom (batched over that atom's 3 directions) and
-combines the density/orbital-energy response with the direct
-(integral-only) second-derivative pieces already validated in Phase 1.
-
-`aoints` is used directly for CPHF's Fock builds (`ints["T"]`/`ints["V"]`/
-`build_fock!` inside `cphf_Amatvec`/`build_response_fock!`) -- its
-`eri_type` (whatever `wfn` was actually converged with, `SparseERI` by
-default) is honored rather than a hardcoded dense `Chonky` build, which
-also avoids the O(nbas^4)-per-CG-iteration dense contraction that hardcoding
-Chonky used to force.
+Full analytic RHF Hessian for the exact-ERI case (Cartesian, `3*Natoms x
+3*Natoms`, atomic units). See `DFHess.jl` for the density-fitted dispatch.
 """
 function RHFhess(ints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.Integrals.Chonky,Fermi.Integrals.SparseERI}}, wfn::RHF)
+    # aoints is used directly for CPHF's Fock builds (build_fock! inside
+    # cphf_Amatvec/build_response_fock!) -- its eri_type is honored rather
+    # than a hardcoded dense Chonky build, which would force an
+    # O(nbas^4)-per-CG-iteration dense contraction.
     molecule = wfn.molecule
     atoms = molecule.atoms
     natm = length(atoms)

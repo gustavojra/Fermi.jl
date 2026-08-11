@@ -28,19 +28,16 @@ end
     RHFgrad(wfn::RHF)
 
 Analytic RHF gradient. Builds a throwaway `IntegralHelper` for `wfn`'s
-molecule/basis and delegates to the `(aoints, wfn)` dispatch matching its
-`eri_type` -- e.g. `Chonky`/`SparseERI`'s dispatch (this file, below) or a
-density-fitted one (`DFgrad.jl`), following the current `@set df <bool>`
-option the same way a fresh `IntegralHelper()` would. No `warn_no_aoints`
-call here, on purpose: unlike `RHFhess`, no dispatch actually touches
-`aoints`'s J/K cache (`aoints["S"]`/`["ERI"]`/etc.) -- only cheap metadata
-(`aoints.basis`/`.molecule`/`.eri_type.basisset`) -- so there's no
-redundant integral computation to warn about, whether `eri_type` ends up
-Chonky/SparseERI or DF. This matters for cost too: this is called every
-geometry-optimizer iteration, and `IntegralHelper` construction itself is
-cheap (it doesn't compute any integrals until indexed into).
+molecule/basis and delegates to the dispatch matching its `eri_type`
+(exact-ERI, this file; density-fitted, `DFgrad.jl`), following the current
+`@set df <bool>` option.
 """
 function RHFgrad(wfn::RHF)
+    # No warn_no_aoints call here, on purpose: unlike RHFhess, no dispatch
+    # reached from here touches aoints's J/K cache, only cheap basis/
+    # molecule metadata -- so there's no redundant integral computation to
+    # warn about. Matters for cost too, since this runs every geometry-
+    # optimizer iteration and IntegralHelper construction itself is cheap.
     aoints = Fermi.Integrals.IntegralHelper(molecule=wfn.molecule, basis=wfn.orbitals.basis)
     RHFgrad(aoints, wfn)
 end
@@ -48,25 +45,17 @@ end
 """
     RHFgrad(wfn::RHF, eri_type::Fermi.Integrals.AbstractERI)
 
-Explicit-`eri_type` entry point -- what `RHFgrad(mol::Molecule,x...)`'s
-`RHFgrad(wfn,x...)` fallback (and, in turn, `@gradient rhf <= SomeERIType()`)
-actually calls. Builds an `aoints` carrying the requested `eri_type` and
-delegates to whichever `(aoints,wfn)` dispatch matches it (this file's
-`Union{Chonky,SparseERI}` method, or `DFgrad.jl`'s) -- there's still only
-ONE algorithm per `eri_type` family, this is just a second, explicit-type
-way to reach it (as opposed to `RHFgrad(wfn::RHF)`'s "whatever the current
-`@set df` option says" convenience path). Without this method, that
-`RHFgrad(wfn,x...)` call falls through to the fully generic `RHFgrad(x...)`
-catch-all instead of erroring -- which re-enters `RHFgrad(mol::Molecule,x...)`,
-reconverges a FRESH SCF, and recurses indefinitely, each level paying for a
-full SCF convergence. (Exactly what happened when an earlier, unrelated
-dense-array-materializing `RHFgrad(wfn::RHF,eri_type::Chonky)` method got
-removed here without noticing `@gradient rhf <= Fermi.Integrals.Chonky()`
--- used by `test_RHF.jl`'s "Chonky" gradient testset -- was its only caller,
-reached through this exact macro-expanded string template rather than any
-literal call site a plain grep would find.)
+Analytic RHF gradient with an explicit `eri_type` (e.g. `@gradient rhf <=
+Fermi.Integrals.Chonky()`), overriding the current `@set df` option.
 """
 function RHFgrad(wfn::RHF, eri_type::Fermi.Integrals.AbstractERI)
+    # Needed to avoid an infinite loop: without this method, RHFgrad(wfn,x...)
+    # falls through to the fully generic RHFgrad(x...) catch-all instead of
+    # dispatching here, which re-enters RHFgrad(mol::Molecule,x...),
+    # reconverges a FRESH SCF, and recurses indefinitely. (Reached via
+    # @gradient's macro-expanded string template, not a literal call site --
+    # easy to miss with a plain grep, which is how this method got
+    # accidentally deleted once before.)
     aoints = Fermi.Integrals.IntegralHelper(molecule=wfn.molecule, basis=wfn.orbitals.basis, eri_type=eri_type)
     RHFgrad(aoints, wfn)
 end
@@ -194,14 +183,9 @@ end
     RHFgrad(aoints::IntegralHelper{Float64,<:Union{Chonky,SparseERI}}, wfn::RHF)
 
 Analytic RHF gradient for the exact-ERI case (`Chonky`/`SparseERI`
-`eri_type`s -- `DFgrad.jl` has the sibling dispatch for density-fitted
-`aoints`, dispatching on `eri_type` the same way, one algorithm for both
-exact-ERI cases since neither affects how the gradient itself is computed).
-Sources its `BasisSet` from `aoints` instead of `wfn` directly, but note
-this doesn't eliminate any redundant AO-integral computation -- see
-`RHFgrad(wfn::RHF)`'s docstring, this dispatch never touches `aoints`'s J/K
-cache at all, only its basis/molecule metadata. See this file's header
-comment above for the two-electron piece's integral-direct strategy.
+`eri_type`s). Returns the Cartesian gradient as a `(Natoms, 3)` matrix,
+atomic units. See `DFgrad.jl` for the density-fitted dispatch, and this
+file's header comment for the integral-direct implementation strategy.
 """
 function RHFgrad(aoints::Fermi.Integrals.IntegralHelper{Float64,<:Union{Fermi.Integrals.Chonky,Fermi.Integrals.SparseERI}}, wfn::RHF)
 

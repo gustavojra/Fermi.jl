@@ -52,15 +52,12 @@ end
     ERI_hess_JK(bset::BasisSet, Dtot, Dα, Dβ, iA::Int, iB::Int; σvals=nothing)
 
 Two-electron Coulomb+exchange contribution to the UHF Hessian block
-(iA,iB), `0.5*C1 - 0.5*C2` -- direct generalization of
-`RHF/Hessians/TwoElectronHess.jl`'s `ERI_hess_JK` to two spin densities
-(same name, different arity, dispatched via Julia's normal multiple
-dispatch, same convention `UHFgrad.jl` already uses). `Dtot,Dα,Dβ` are
-treated as fixed (the converged SCF densities); the UCPHF density-response
-contribution is a separate term. `σvals` is
-`GaussianBasis.schwarz_bounds(bset)`'s second return value, atom-pair-
-independent -- see the RHF version's docstring, same threading/screening
-rationale.
+`(iA,iB)`, `0.5*C1 - 0.5*C2`. `Dtot,Dα,Dβ` are treated as fixed (the
+converged SCF densities); the UCPHF density-response contribution is
+assembled separately. `σvals` (optional, `GaussianBasis.schwarz_bounds(bset)`)
+is atom-pair-independent -- callers looping over many `(iA,iB)` pairs
+should compute it once and pass it through. See `RHF/Hessians/TwoElectronHess.jl`
+for the RHF version this generalizes.
 """
 function ERI_hess_JK(bset::BasisSet, Dtot::AbstractMatrix, Dα::AbstractMatrix, Dβ::AbstractMatrix, iA::Int, iB::Int; σvals = nothing)
     Nvals = GaussianBasis.num_basis.(bset.basis)

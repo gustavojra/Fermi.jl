@@ -198,16 +198,10 @@ end
 """
     cphf_solve_df_full(wfn, ints, iA, cache)
 
-DF analog of `cphf_solve_full` (CPHF.jl) -- same relationship to
-`cphf_solve_df` as that function has to `cphf_solve`, same two fixes:
-returns `cphf_rhs_df`'s `∂H,∂S,Jq_all,Kq_all` alongside `U` so
-`_rhf_hess_response_df` doesn't need a second, redundant
-`∇kinetic!`/`∇nuclear!`/`∇overlap!`/`eri_grad_JK_df` pass, and solves the
-symmetrically Jacobi-preconditioned system (scaling by `d := sqrt.(Δeps)`)
-instead of the raw operator -- see `cphf_solve_full`'s docstring for the
-derivation and the profiling that motivated it (identical operator-
-conditioning issue here, `cphf_Amatvec` is shared unchanged between the
-exact-ERI and DF paths).
+DF analog of `cphf_solve_full` (CPHF.jl): solves the Jacobi-preconditioned
+CPHF equations and also returns `cphf_rhs_df`'s intermediates alongside
+`U`. See `cphf_solve_full`'s comment for the preconditioning derivation
+(`cphf_Amatvec` is shared, unchanged, between the exact-ERI and DF paths).
 """
 function cphf_solve_df_full(wfn::RHF, ints, iA::Int, cache)
     ndocc = wfn.ndocc
@@ -403,13 +397,7 @@ end
     RHFhess(ints::IntegralHelper{Float64,<:AbstractDFERI}, wfn::RHF)
 
 Full analytic DF-RHF Hessian (Cartesian, `3*Natoms x 3*Natoms`, atomic
-units) -- DF analog of `RHFhess`'s exact-ERI dispatch (`RHFhess.jl`), same
-overall assembly (direct integral-response terms + CPHF orbital/density
-response), with every two-electron piece routed through the DF cache
-(`build_df_hess_cache`) instead of dense/sparse exact-ERI machinery. `ints`
-is used directly for CPHF's Fock builds (already DF-dispatching via
-`build_fock!`), and its auxiliary basis (`ints.eri_type.basisset`) supplies
-both the metric and the 3-center integrals throughout.
+units). See `RHFhess.jl` for the exact-ERI dispatch.
 """
 function RHFhess(ints::Fermi.Integrals.IntegralHelper{Float64,<:Fermi.Integrals.AbstractDFERI}, wfn::RHF)
     molecule = wfn.molecule

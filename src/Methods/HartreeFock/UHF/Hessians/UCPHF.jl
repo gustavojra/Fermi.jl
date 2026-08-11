@@ -36,15 +36,14 @@ function _calcJK_uhf!(Jα, Jβ, Kα, Kβ, Dα, Dβ, ints::IntegralHelper{Float64
     calcJK!(Jβ, Kβ, Dβ, ints)
 end
 
+# Bundled into a struct (rather than threaded as separate positional args,
+# CPHF.jl's style) since UHF's doubled (α,β) channels would otherwise mean
+# ~18 positional scratch arguments per call.
 """
     UCPHFScratch(nbas, nvirα, noccα, nvirβ, noccβ)
 
-Bundles every buffer `ucphf_Amatvec!`'s call chain needs, reused across
-every CG iteration (all 3 directions) of one `ucphf_solve_full` call --
-same motivation as `CPHF.jl`'s scratch-buffer `cphf_Amatvec!`, just
-bundled into a struct here rather than threaded as separate positional
-args, since UHF's doubled (α,β) channels would otherwise mean ~18
-positional scratch arguments per call.
+Scratch buffers for `ucphf_Amatvec!`'s call chain, reused across every CG
+iteration of one `ucphf_solve_full` call instead of allocating fresh.
 """
 struct UCPHFScratch
     ΔFα::Matrix{Float64}; ΔFβ::Matrix{Float64}
@@ -85,13 +84,9 @@ function _response_fock_from_densities!(ΔFα, ΔFβ, ΔDα, ΔDβ, ints)
     return ΔFα, ΔFβ
 end
 
-"""
-    _response_fock_from_densities!(ΔFα, ΔFβ, ΔDα, ΔDβ, ints, scr::UCPHFScratch)
-
-Scratch-buffer-accepting core: `scr.Jα/Jβ/Kα/Kβ` reused instead of
-allocated fresh (and no separate `Jtot` temporary -- `ΔFα`/`ΔFβ` are each
-computed via one fused broadcast). See `UCPHFScratch`'s docstring.
-"""
+# Scratch-buffer core: scr.Jα/Jβ/Kα/Kβ reused instead of allocated fresh
+# (and no separate Jtot temporary -- ΔFα/ΔFβ are each computed via one
+# fused broadcast).
 function _response_fock_from_densities!(ΔFα, ΔFβ, ΔDα, ΔDβ, ints, scr::UCPHFScratch)
     _calcJK_uhf!(scr.Jα, scr.Jβ, scr.Kα, scr.Kβ, ΔDα, ΔDβ, ints)
     ΔFα .= scr.Jα .+ scr.Jβ .- scr.Kα
@@ -115,14 +110,9 @@ function build_response_fock!(ΔFα, ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, in
     return _response_fock_from_densities!(ΔFα, ΔFβ, ΔDα, ΔDβ, ints)
 end
 
-"""
-    build_response_fock!(ΔFα, ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, ints, scr::UCPHFScratch)
-
-Scratch-buffer-accepting core: `ΔDα`/`ΔDβ` built via `mul!` into
-`scr.ΔDα`/`scr.ΔDβ` (through `scr.tmpα`/`scr.tmpβ` for the `Cvσ*Uσ` step)
-instead of allocating fresh matrix-multiply temporaries. See
-`UCPHFScratch`'s docstring.
-"""
+# Scratch-buffer core: ΔDα/ΔDβ built via mul! into scr.ΔDα/scr.ΔDβ
+# (through scr.tmpα/scr.tmpβ for the Cvσ*Uσ step) instead of allocating
+# fresh matrix-multiply temporaries.
 function build_response_fock!(ΔFα, ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, ints, scr::UCPHFScratch)
     mul!(scr.tmpα, Cvα, Uα)
     mul!(scr.ΔDα, scr.tmpα, Coα')
@@ -139,14 +129,15 @@ end
     ucphf_Amatvec((Uα,Uβ), Coα, Cvα, Coβ, Cvβ, ints)
 
 The coupled UCPHF matrix's action on a trial rotation pair, returned as a
-`(nvirα,noccα)`,`(nvirβ,noccβ)` tuple in the same shape/index convention as
-`(Uα,Uβ)`. Thin wrapper around `build_response_fock!` for use as a
-`KrylovKit.linsolve` linear map -- `KrylovKit`/`VectorInterface` handle a
-homogeneous `Tuple` of arrays as a vector type natively (verified directly
-before relying on it here), so `(Uα,Uβ)` needs no flattening or custom
-vector-space glue.
+`(nvirα,noccα)`,`(nvirβ,noccβ)` tuple matching `(Uα,Uβ)`'s shape. Thin
+wrapper around `build_response_fock!` for use as a `KrylovKit.linsolve`
+linear map.
 """
 function ucphf_Amatvec((Uα, Uβ), Coα, Cvα, Coβ, Cvβ, ints)
+    # (Uα,Uβ) as a plain Tuple works directly with KrylovKit.linsolve --
+    # KrylovKit/VectorInterface handle a homogeneous Tuple of arrays as a
+    # vector type natively (verified directly before relying on it here),
+    # no flattening or custom vector-space glue needed.
     nbas = size(Coα, 1)
     ΔFα = zeros(nbas, nbas)
     ΔFβ = zeros(nbas, nbas)
@@ -154,15 +145,9 @@ function ucphf_Amatvec((Uα, Uβ), Coα, Cvα, Coβ, Cvβ, ints)
     return (Cvα' * ΔFα * Coα, Cvβ' * ΔFβ * Coβ)
 end
 
-"""
-    ucphf_Amatvec!((resultα,resultβ), (Uα,Uβ), Coα, Cvα, Coβ, Cvβ, ints, scr::UCPHFScratch)
-
-Scratch-buffer-accepting core of `ucphf_Amatvec` -- `resultα`/`resultβ`
-are written in place and returned (as a tuple, matching `(Uα,Uβ)`'s
-shape/convention); `scr.tmp2α`/`scr.tmp2β` hold the `Cvσ'*ΔFσ`
-intermediate. Same motivation as `CPHF.jl`'s `cphf_Amatvec!` (this is its
-UCPHF analog, called once per CG iteration).
-"""
+# Scratch-buffer core of ucphf_Amatvec, called once per CG iteration --
+# resultα/resultβ written in place and returned; scr.tmp2α/scr.tmp2β hold
+# the Cvσ'*ΔFσ intermediate.
 function ucphf_Amatvec!((resultα, resultβ), (Uα, Uβ), Coα, Cvα, Coβ, Cvβ, ints, scr::UCPHFScratch)
     build_response_fock!(scr.ΔFα, scr.ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, ints, scr)
     mul!(scr.tmp2α, Cvα', scr.ΔFα)
@@ -177,16 +162,16 @@ end
 
 UHF analog of `CPHF.jl`'s `eri_grad_JK`: `Jq[m,n] = Σ_rs Dtot[r,s]*d(mn|rs)/dA_q`
 (Coulomb, from the total density -- shared between spins), `Kqα[m,n] =
-Σ_rs Dα[r,s]*d(mr|ns)/dA_q`, `Kqβ` likewise from `Dβ`. Computes the
-compressed derivative-quartet list (`GaussianBasis.∇sparseERI_2e4c`) only
-ONCE and accumulates all three (`Jq`,`Kqα`,`Kqβ`) in the same pass, rather
-than calling `eri_grad_JK` three times (once per density) and rebuilding
-that same list redundantly -- exactly the same "share the quartet list,
-vary only the density contraction" idea `RHFgrad`->`UHFgrad`'s
-`contract_canonical`/`contract_cross` generalization already uses one
-derivative order down.
+Σ_rs Dα[r,s]*d(mr|ns)/dA_q`, `Kqβ` likewise from `Dβ`.
 """
 function eri_grad_JK_uhf(bset::BasisSet, Dtot::AbstractMatrix, Dα::AbstractMatrix, Dβ::AbstractMatrix, iA::Int; ij_vals = nothing, σvals = nothing)
+    # Computes the compressed derivative-quartet list
+    # (GaussianBasis.∇sparseERI_2e4c) only ONCE and accumulates all three
+    # (Jq,Kqα,Kqβ) in the same pass, rather than calling eri_grad_JK three
+    # times (once per density) and rebuilding that list redundantly --
+    # same "share the quartet list, vary only the density contraction"
+    # idea RHFgrad->UHFgrad's contract_canonical/contract_cross
+    # generalization uses one derivative order down.
     nbas = bset.nbas
     Jq = zeros(nbas, nbas, 3)
     Kqα = zeros(nbas, nbas, 3)
@@ -213,18 +198,17 @@ end
     ucphf_rhs(wfn::UHF, ints, iA; ij_vals=nothing, σvals=nothing)
 
 UCPHF right-hand side, `(Bα,Bβ)` for all three Cartesian directions of atom
-`iA`, alongside the `∂H,∂S,Jq_tot,Kqα,Kqβ` intermediates it was built from
--- same "return the intermediates too" design as `CPHF.jl`'s `cphf_rhs`,
-so `_uhf_hess_response` doesn't need a second, redundant pass to get them
-again (see `ucphf_solve_full`'s docstring). Bα/Bβ's "skeleton" piece
-(`Fskelα = ∂H + 2*Jq_tot - Kqα`, `Fskelβ` likewise with `Kqβ`) and
-occ-occ-orthonormality-correction piece (`dD_S,σ := -Coσ*S_ooσ^(y)*Coσ'`,
-response Fock via `_response_fock_from_densities!` -- the correction is
-per-spin in how it's built but still Coulomb-coupled in its Fock response,
-same as everywhere else here) both mirror `cphf_rhs`'s RHF formula one
-spin channel at a time.
+`iA`, alongside the `∂H,∂S,Jq_tot,Kqα,Kqβ` intermediates it was built from.
 """
 function ucphf_rhs(wfn::UHF, ints, iA::Int; ij_vals = nothing, σvals = nothing)
+    # ∂H/∂S/Jq_tot/Kqα/Kqβ are returned (not just B) so _uhf_hess_response
+    # can reuse them instead of a second, redundant pass -- same design as
+    # CPHF.jl's cphf_rhs (see ucphf_solve_full's comment). Bα/Bβ's
+    # "skeleton" piece (Fskelα=∂H+Jq_tot-Kqα, Fskelβ likewise with Kqβ) and
+    # occ-occ-orthonormality-correction piece (dD_S,σ:=-Coσ*S_ooσ^(y)*Coσ',
+    # response Fock via _response_fock_from_densities! -- built per spin
+    # but still Coulomb-coupled in its Fock response) both mirror
+    # cphf_rhs's RHF formula one spin channel at a time.
     bset = BasisSet(wfn.orbitals.basis, wfn.molecule.atoms)
     nbas = bset.nbas
     Nα = wfn.molecule.Nα
@@ -296,25 +280,18 @@ end
     ucphf_solve_full(wfn::UHF, ints, iA)
 
 Same solve as `ucphf_solve`, but also returns `ucphf_rhs`'s intermediate
-`∂H,∂S,Jq_tot,Kqα,Kqβ` alongside `(Uα,Uβ)`, for the same reason (and same
-measured payoff on the RHF side, ~97s of ~276s total CPHF time on a real
-24-atom molecule) `CPHF.jl`'s `cphf_solve_full` does -- see that
-docstring.
-
-Solves the coupled system via `KrylovKit.linsolve` with CG (block operator
-`[[Δεα+A^αα, A^αβ],[A^βα, Δεβ+A^ββ]]` is symmetric positive definite at a
-true UHF minimum, same argument as the RHF case one spin channel at a
-time), one right-hand-side triple at a time, symmetrically
-Jacobi-preconditioned per spin (`dα := sqrt.(εα_a-εα_i)`, `dβ` likewise) --
-built in from the start rather than retrofitted, since the RHF CPHF work
-found plain CG hitting `cphf_max_iter` on ~85% of right-hand sides for
-exactly this reason (the ε_a-ε_i denominators span a huge range) and the
-same operator-conditioning issue applies per spin channel here. `(Uα,Uβ)`
-is represented as a plain `Tuple{Matrix,Matrix}` throughout -- see
-`ucphf_Amatvec`'s docstring for why that's safe with `KrylovKit.linsolve`
-directly, no flattening needed.
+`∂H,∂S,Jq_tot,Kqα,Kqβ` alongside `(Uα,Uβ)`. Solves the coupled system via
+`KrylovKit.linsolve` with (per-spin Jacobi-preconditioned) CG.
 """
 function ucphf_solve_full(wfn::UHF, ints, iA::Int; ij_vals = nothing, σvals = nothing)
+    # The block operator [[Δεα+A^αα, A^αβ],[A^βα, Δεβ+A^ββ]] is SPD at a
+    # true UHF minimum (same argument as the RHF case, one spin channel at
+    # a time). Preconditioned per spin (dα:=sqrt.(εα_a-εα_i), dβ likewise)
+    # from the start rather than retrofitted -- the RHF CPHF work found
+    # plain CG hitting cphf_max_iter on ~85% of right-hand sides for
+    # exactly this reason (the ε_a-ε_i denominators span a huge range), and
+    # the same operator-conditioning issue applies per spin channel here.
+    # See CPHF.jl's cphf_solve_full comment for the full derivation.
     Nα = wfn.molecule.Nα
     Nβ = wfn.molecule.Nβ
     nbas = size(wfn.orbitals.Cα, 1)
