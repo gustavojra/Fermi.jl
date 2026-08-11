@@ -75,12 +75,92 @@ Edf =   [-75.41960080317435, -39.56380446089254, -38.93785583198393]
     @set printstyle none
     @testset "Gradients" begin
 
-        # Test argument error         
+        # Test argument error
         Fermi.Options.set("deriv_type", "Test error")
         @test_throws Fermi.Options.FermiException Fermi.HartreeFock.UHFgrad()
 
         Fermi.Options.set("deriv_type", "analytic")
-        @test_throws Fermi.Options.FermiException Fermi.HartreeFock.UHFgrad()
 
+        # Closed-shell reduction: UHF forced on a closed-shell singlet must
+        # reduce to Dα=Dβ and reproduce the already-validated RHF gradient
+        # to near machine precision -- see UHFgrad.jl's header comment for
+        # the derivation this checks (X^A_UHF reduces exactly to RHF's X^A
+        # in this limit). A much stronger, external-reference-independent
+        # check than finite difference or Psi4 alone.
+        @testset "Closed-shell reduction to RHF" begin
+            Fermi.Options.set("molstring", """
+            O        0.000000000000     0.000000000000     0.000000000000
+            H        0.000000000000     0.000000000000     0.950000000000
+            H        0.895669800000     0.000000000000    -0.316663000000
+            """)
+            Fermi.Options.set("basis", "cc-pvdz")
+            Fermi.Options.set("charge", 0)
+            Fermi.Options.set("multiplicity", 1)
+
+            rhf_wfn = @energy rhf
+            rhf_g = Fermi.HartreeFock.RHFgrad(rhf_wfn)
+
+            uhf_wfn = Fermi.HartreeFock.UHF()
+            uhf_g = Fermi.HartreeFock.UHFgrad(uhf_wfn)
+
+            @test isapprox(uhf_wfn.energy, rhf_wfn.energy, atol=1e-10)
+            @test maximum(abs.(uhf_g .- rhf_g)) < 1e-9
+        end
+
+        # Open-shell references from a fresh Psi4 UHF gradient (scf_type
+        # pk, matching Fermi's exact-ERI dispatch), same uhf_boys systems
+        # the energy tests above already validate against Psi4 -- one
+        # doublet (oh), one doublet radical (methyl), one triplet
+        # (methylene), covering both Nα>Nβ>0 cases used elsewhere in this
+        # file plus a genuinely different spin multiplicity.
+        ref_uhf_grads = Dict(
+            "oh" => [0.0 0.0 0.00012086175; 0.0 0.0 -0.00012086175],
+            "methyl" => [-9.3854145e-5 -4.3407006e-5 -1.119603e-6;
+                          1.3629195e-5  2.0166761e-5 -1.842176e-6;
+                          2.26684e-6    9.317891e-6   7.38686e-7;
+                          7.795811e-5   1.3922353e-5  2.223093e-6],
+            "methylene" => [-0.0  0.0           9.737248e-6;
+                             -0.0  7.1956668e-5 -4.868624e-6;
+                              0.0 -7.1956668e-5 -4.868624e-6],
+        )
+        @testset "Psi4 reference (exact-ERI)" begin
+            for i = eachindex(uhf_boys)
+                path = joinpath(@__DIR__, "xyz/"*uhf_boys[i][1]*".xyz")
+                mol = open(f->read(f,String), path)
+
+                Fermi.Options.set("df", false)
+                Fermi.Options.set("molstring", mol)
+                Fermi.Options.set("basis", uhf_boys[i][2])
+                Fermi.Options.set("reference", "uhf")
+                Fermi.Options.set("charge", uhf_boys[i][3])
+                Fermi.Options.set("multiplicity", uhf_boys[i][4])
+
+                g = @gradient uhf
+                ref = ref_uhf_grads[uhf_boys[i][1]]
+                rms = sqrt(sum((g .- ref).^2)/length(g))
+                @test rms < 1e-7
+            end
+        end
+
+        # Nβ=0 edge case (untested by any of the uhf_boys systems above,
+        # all of which have Nβ>=3): a bare doublet H atom. Regression test
+        # for the odadamping 0/0 (NaN) bug this uncovered -- see
+        # UHFHelper.jl's odadamping, dD is identically zero for the whole
+        # SCF when a spin channel is empty, so c=tr((F-Fs)*dD)=0 exactly,
+        # and the un-guarded -s/(2*c) branch condition was a literal 0/0.
+        # Gradient must be exactly zero (single atom, translational
+        # invariance).
+        @testset "Nβ=0 edge case" begin
+            Fermi.Options.set("df", false)
+            Fermi.Options.set("molstring", "H 0.0 0.0 0.0")
+            Fermi.Options.set("basis", "cc-pvdz")
+            Fermi.Options.set("charge", 0)
+            Fermi.Options.set("multiplicity", 2)
+
+            wfn = Fermi.HartreeFock.UHF()
+            @test isfinite(wfn.energy)
+            g = Fermi.HartreeFock.UHFgrad(wfn)
+            @test all(iszero, g)
+        end
     end
 end
