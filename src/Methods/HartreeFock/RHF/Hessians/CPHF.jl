@@ -48,6 +48,28 @@ function build_response_fock!(ΔF, U, Co, Cv, ints)
 end
 
 """
+    build_response_fock!(ΔF, U, Co, Cv, ints, ΔD, H0, tmp)
+
+Scratch-buffer-accepting core: `ΔD` (nbas,nbas), `H0` (nbas,nbas, always
+zero -- `build_fock!` only reads it), `tmp` (nbas,ndocc) are caller-owned
+and reused across calls instead of allocating fresh -- this is the CPHF
+matrix-vector product, called once per CG iteration (up to `cphf_max_iter`
+times) per Cartesian direction per atom, so the old allocating form's
+`ΔD`/`H0` (each `zeros(nbas,nbas)`) added up over a full Hessian the same
+way the gradient's/direct-Hessian's per-quartet allocation did (see
+`RHFgrad.jl`'s and `GaussianBasis.jl`'s scratch-buffer docstrings for that
+earlier fix) -- smaller in absolute magnitude here (O(cphf_max_iter*3*natm)
+calls, not O(nshells^4)), but the same avoidable churn.
+"""
+function build_response_fock!(ΔF, U, Co, Cv, ints, ΔD, H0, tmp)
+    mul!(tmp, Cv, U)
+    mul!(ΔD, tmp, Co')
+    ΔD .+= ΔD'
+    build_fock!(ΔF, H0, ΔD, ints)
+    return ΔF
+end
+
+"""
     cphf_Amatvec(U, Co, Cv, ints)
 
 The CPHF coupling matrix's action on a trial occ-virt rotation `U`,
@@ -60,6 +82,22 @@ function cphf_Amatvec(U, Co, Cv, ints)
     ΔF = zeros(nbas, nbas)
     build_response_fock!(ΔF, U, Co, Cv, ints)
     return Cv' * ΔF * Co
+end
+
+"""
+    cphf_Amatvec!(result, U, Co, Cv, ints, ΔF, ΔD, H0, tmp, tmp2)
+
+Scratch-buffer-accepting core of `cphf_Amatvec` -- `result` (nvir,ndocc,
+written in place and returned), `ΔF` (nbas,nbas), `tmp2` (nvir,nbas) are
+caller-owned alongside `build_response_fock!`'s own `ΔD`/`H0`/`tmp`. See
+that function's docstring for the motivation (this is its caller, once per
+CG iteration).
+"""
+function cphf_Amatvec!(result, U, Co, Cv, ints, ΔF, ΔD, H0, tmp, tmp2)
+    build_response_fock!(ΔF, U, Co, Cv, ints, ΔD, H0, tmp)
+    mul!(tmp2, Cv', ΔF)
+    mul!(result, tmp2, Co)
+    return result
 end
 
 # --- CPHF right-hand side ---
@@ -245,8 +283,22 @@ function cphf_solve_full(wfn::RHF, ints, iA; ij_vals = nothing, σvals = nothing
 
     B, ∂H, ∂S, Jq_all, Kq_all = cphf_rhs(wfn, ints, iA; ij_vals=ij_vals, σvals=σvals)
     U = zeros(nvir, ndocc, 3)
+
+    # Reused across every CG iteration (all 3 directions) instead of
+    # letting cphf_Amatvec/build_response_fock! allocate ΔF/ΔD/H0/tmp/tmp2
+    # fresh on every matvec call -- see cphf_Amatvec!'s docstring.
+    ΔF = zeros(nbas, nbas)
+    ΔD = zeros(nbas, nbas)
+    H0 = zeros(nbas, nbas)
+    tmp = zeros(nbas, ndocc)
+    tmp2 = zeros(nvir, nbas)
+    result = zeros(nvir, ndocc)
+
     for q in 1:3
-        precond_matvec(y) = y .+ cphf_Amatvec(y ./ d, Co, Cv, ints) ./ d
+        function precond_matvec(y)
+            cphf_Amatvec!(result, y ./ d, Co, Cv, ints, ΔF, ΔD, H0, tmp, tmp2)
+            return y .+ result ./ d
+        end
         rhs = -B[:, :, q] ./ d
         sol, info = KrylovKit.linsolve(precond_matvec, rhs, zeros(nvir, ndocc), KrylovKit.CG(; maxiter=maxiter, tol=tol))
         U[:, :, q] .= sol ./ d

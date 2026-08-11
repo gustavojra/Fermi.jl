@@ -37,6 +37,36 @@ function _calcJK_uhf!(Jα, Jβ, Kα, Kβ, Dα, Dβ, ints::IntegralHelper{Float64
 end
 
 """
+    UCPHFScratch(nbas, nvirα, noccα, nvirβ, noccβ)
+
+Bundles every buffer `ucphf_Amatvec!`'s call chain needs, reused across
+every CG iteration (all 3 directions) of one `ucphf_solve_full` call --
+same motivation as `CPHF.jl`'s scratch-buffer `cphf_Amatvec!`, just
+bundled into a struct here rather than threaded as separate positional
+args, since UHF's doubled (α,β) channels would otherwise mean ~18
+positional scratch arguments per call.
+"""
+struct UCPHFScratch
+    ΔFα::Matrix{Float64}; ΔFβ::Matrix{Float64}
+    ΔDα::Matrix{Float64}; ΔDβ::Matrix{Float64}
+    Jα::Matrix{Float64}; Jβ::Matrix{Float64}
+    Kα::Matrix{Float64}; Kβ::Matrix{Float64}
+    tmpα::Matrix{Float64}; tmpβ::Matrix{Float64}     # Cvσ*Uσ, (nbas,noccσ)
+    tmp2α::Matrix{Float64}; tmp2β::Matrix{Float64}   # Cvσ'*ΔFσ, (nvirσ,nbas)
+end
+
+function UCPHFScratch(nbas::Int, nvirα::Int, noccα::Int, nvirβ::Int, noccβ::Int)
+    UCPHFScratch(
+        zeros(nbas, nbas), zeros(nbas, nbas),
+        zeros(nbas, nbas), zeros(nbas, nbas),
+        zeros(nbas, nbas), zeros(nbas, nbas),
+        zeros(nbas, nbas), zeros(nbas, nbas),
+        zeros(nbas, noccα), zeros(nbas, noccβ),
+        zeros(nvirα, nbas), zeros(nvirβ, nbas),
+    )
+end
+
+"""
     _response_fock_from_densities!(ΔFα, ΔFβ, ΔDα, ΔDβ, ints)
 
 Core J/K-only (no one-electron piece) response-Fock build shared by
@@ -52,6 +82,20 @@ function _response_fock_from_densities!(ΔFα, ΔFβ, ΔDα, ΔDβ, ints)
     Jtot = Jα .+ Jβ
     ΔFα .= Jtot .- Kα
     ΔFβ .= Jtot .- Kβ
+    return ΔFα, ΔFβ
+end
+
+"""
+    _response_fock_from_densities!(ΔFα, ΔFβ, ΔDα, ΔDβ, ints, scr::UCPHFScratch)
+
+Scratch-buffer-accepting core: `scr.Jα/Jβ/Kα/Kβ` reused instead of
+allocated fresh (and no separate `Jtot` temporary -- `ΔFα`/`ΔFβ` are each
+computed via one fused broadcast). See `UCPHFScratch`'s docstring.
+"""
+function _response_fock_from_densities!(ΔFα, ΔFβ, ΔDα, ΔDβ, ints, scr::UCPHFScratch)
+    _calcJK_uhf!(scr.Jα, scr.Jβ, scr.Kα, scr.Kβ, ΔDα, ΔDβ, ints)
+    ΔFα .= scr.Jα .+ scr.Jβ .- scr.Kα
+    ΔFβ .= scr.Jα .+ scr.Jβ .- scr.Kβ
     return ΔFα, ΔFβ
 end
 
@@ -72,6 +116,26 @@ function build_response_fock!(ΔFα, ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, in
 end
 
 """
+    build_response_fock!(ΔFα, ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, ints, scr::UCPHFScratch)
+
+Scratch-buffer-accepting core: `ΔDα`/`ΔDβ` built via `mul!` into
+`scr.ΔDα`/`scr.ΔDβ` (through `scr.tmpα`/`scr.tmpβ` for the `Cvσ*Uσ` step)
+instead of allocating fresh matrix-multiply temporaries. See
+`UCPHFScratch`'s docstring.
+"""
+function build_response_fock!(ΔFα, ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, ints, scr::UCPHFScratch)
+    mul!(scr.tmpα, Cvα, Uα)
+    mul!(scr.ΔDα, scr.tmpα, Coα')
+    scr.ΔDα .+= scr.ΔDα'
+
+    mul!(scr.tmpβ, Cvβ, Uβ)
+    mul!(scr.ΔDβ, scr.tmpβ, Coβ')
+    scr.ΔDβ .+= scr.ΔDβ'
+
+    return _response_fock_from_densities!(ΔFα, ΔFβ, scr.ΔDα, scr.ΔDβ, ints, scr)
+end
+
+"""
     ucphf_Amatvec((Uα,Uβ), Coα, Cvα, Coβ, Cvβ, ints)
 
 The coupled UCPHF matrix's action on a trial rotation pair, returned as a
@@ -88,6 +152,24 @@ function ucphf_Amatvec((Uα, Uβ), Coα, Cvα, Coβ, Cvβ, ints)
     ΔFβ = zeros(nbas, nbas)
     build_response_fock!(ΔFα, ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, ints)
     return (Cvα' * ΔFα * Coα, Cvβ' * ΔFβ * Coβ)
+end
+
+"""
+    ucphf_Amatvec!((resultα,resultβ), (Uα,Uβ), Coα, Cvα, Coβ, Cvβ, ints, scr::UCPHFScratch)
+
+Scratch-buffer-accepting core of `ucphf_Amatvec` -- `resultα`/`resultβ`
+are written in place and returned (as a tuple, matching `(Uα,Uβ)`'s
+shape/convention); `scr.tmp2α`/`scr.tmp2β` hold the `Cvσ'*ΔFσ`
+intermediate. Same motivation as `CPHF.jl`'s `cphf_Amatvec!` (this is its
+UCPHF analog, called once per CG iteration).
+"""
+function ucphf_Amatvec!((resultα, resultβ), (Uα, Uβ), Coα, Cvα, Coβ, Cvβ, ints, scr::UCPHFScratch)
+    build_response_fock!(scr.ΔFα, scr.ΔFβ, Uα, Uβ, Coα, Cvα, Coβ, Cvβ, ints, scr)
+    mul!(scr.tmp2α, Cvα', scr.ΔFα)
+    mul!(resultα, scr.tmp2α, Coα)
+    mul!(scr.tmp2β, Cvβ', scr.ΔFβ)
+    mul!(resultβ, scr.tmp2β, Coβ)
+    return (resultα, resultβ)
 end
 
 """
@@ -256,10 +338,19 @@ function ucphf_solve_full(wfn::UHF, ints, iA::Int; ij_vals = nothing, σvals = n
 
     Uα = zeros(nvirα, Nα, 3)
     Uβ = zeros(nvirβ, Nβ, 3)
+
+    # Reused across every CG iteration (all 3 directions) instead of
+    # letting ucphf_Amatvec/build_response_fock! allocate fresh on every
+    # matvec call -- see UCPHFScratch's docstring (UHF analog of
+    # CPHF.jl's cphf_Amatvec! fix).
+    scr = UCPHFScratch(nbas, nvirα, Nα, nvirβ, Nβ)
+    resultα = zeros(nvirα, Nα)
+    resultβ = zeros(nvirβ, Nβ)
+
     for q in 1:3
         function precond_matvec((yα, yβ))
-            rα, rβ = ucphf_Amatvec((yα ./ dα, yβ ./ dβ), Coα, Cvα, Coβ, Cvβ, ints)
-            return (yα .+ rα ./ dα, yβ .+ rβ ./ dβ)
+            ucphf_Amatvec!((resultα, resultβ), (yα ./ dα, yβ ./ dβ), Coα, Cvα, Coβ, Cvβ, ints, scr)
+            return (yα .+ resultα ./ dα, yβ .+ resultβ ./ dβ)
         end
         rhs = (-Bα[:, :, q] ./ dα, -Bβ[:, :, q] ./ dβ)
         x0 = (zeros(nvirα, Nα), zeros(nvirβ, Nβ))
