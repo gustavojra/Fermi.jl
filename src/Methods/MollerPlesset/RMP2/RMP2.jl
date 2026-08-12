@@ -71,11 +71,6 @@ include("RMP2a.jl")
 # And a number is assigned to the implementation
 get_rmp2_alg(x::Val{1}) = RMP2a()
 
-struct RMP2b <: RMP2Algorithm end
-include("RMP2b.jl")
-# And a number is assigned to the implementation
-get_rmp2_alg(x::Val{2}) = RMP2b()
-
 function RMP2(x...)
     if !any(i-> i isa RMP2Algorithm, x)
         RMP2(x..., get_rmp2_alg())
